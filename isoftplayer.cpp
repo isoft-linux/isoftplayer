@@ -6,11 +6,6 @@
 
 #include "isoftplayer.h"
 
-#define ms_debug(fmt, ...)  do {                                        \
-        av_log(NULL, AV_LOG_INFO, "[%lx]", (long)QThread::currentThread()); \
-        av_log(NULL, AV_LOG_INFO, fmt, ##__VA_ARGS__);                  \
-    } while(0)
-
 static void err_quit(const char *fmt, ...)
 {
     va_list ap;
@@ -23,6 +18,7 @@ static void err_quit(const char *fmt, ...)
 
 static double get_audio_clock(MediaState *ms)
 {
+    //FIXME: should be lock protected ?
     return ms->audio_clock = (double)ms->output_dev->processedUSecs() / 1000000.0;
 }
 
@@ -46,7 +42,7 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 		err_quit("avcodec_open failed");
 	}
 
-    av_log(NULL, AV_LOG_INFO, "open_codec_for_type %d at %d\n", codec_type, stream_id);
+    ms_debug( "open_codec_for_type %d at %d\n", codec_type, stream_id);
     switch(codec_type) {
     case AVMEDIA_TYPE_VIDEO:
         ms->video_context = avctx;
@@ -71,6 +67,8 @@ void mediastate_close(MediaState *ms)
     ms_debug("clean up\n");
     ms->quit = 1;
     ms->picture_queue.cond->wakeAll();
+
+    delete ms->player;
 
     free((void*)ms->media_name);
     if (ms->video_context) {
@@ -124,6 +122,7 @@ MediaState *mediastate_init(const char *filename)
     // open_codec_for_type(ms, AVMEDIA_TYPE_SUBTITLE);
 
     ms->decode_thread = new DecodeThread(ms);
+    ms->player = new MediaPlayer(ms);
 
     if (ms->video_context) {
         ms->video_thread = new VideoThread(ms);
@@ -168,8 +167,26 @@ MediaState *mediastate_init(const char *filename)
 MediaPlayer::MediaPlayer(MediaState *ms)
     :QWidget(0), _mediaState(ms)
 {
+    setAttribute(Qt::WA_TranslucentBackground);
+    // setAttribute(Qt::WA_OpaquePaintEvent);
+    setAttribute(Qt::WA_NoSystemBackground);
+    setAutoFillBackground(false);
+
+    ms->player = this;
     QSize dsize = qApp->desktop()->geometry().size();
-    setFixedSize(960, 540);
+    if (ms->video_context) {
+        QSize vsize(ms->video_context->width, ms->video_context->height);
+        if (vsize.height() > dsize.height() || vsize.width() > dsize.width()) {
+            vsize.scale(dsize, Qt::KeepAspectRatio);
+        }
+        setFixedSize(vsize);
+
+    } else
+        setFixedSize(960, 540);
+
+    ms->video_width = width();
+    ms->video_height = height();
+
     move((dsize.width()-width())/2, (dsize.height()-height())/2);
 
     QTimer::singleShot(0, this, SLOT(run()));
@@ -181,12 +198,16 @@ MediaPlayer::~MediaPlayer()
 
 void MediaPlayer::run()
 {
-    // QThread::currentThread()->setPriority(QThread::HighPriority);
     _mediaState->decode_thread->start(QThread::IdlePriority);
-    _mediaState->video_thread->start();
-    _mediaState->audio_thread->start();
+    if (_mediaState->video_context) {
+        _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
+        _mediaState->video_thread->start();
 
-    _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
+    }
+
+    if (_mediaState->audio_context)
+        _mediaState->audio_thread->start();
+
     updateDisplay();
 }
 
@@ -227,8 +248,7 @@ void MediaPlayer::updateDisplay()
              vp.pts, sync_threshold, delay, actual_delay, ref_clock, actual_delay);
     scheduleUpdate(actual_delay * 1000);
 
-    //FIXME: use sws to scale size would be better
-    _surface = frame.scaled(size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    _surface = frame;
     update();
 
     // _mediaState->picture_timer = (double)av_gettime()/1000000.0;
@@ -380,19 +400,22 @@ VideoThread::VideoThread(MediaState *ms)
 
 
     //FIXME: if output support yuv420p, then no need to convert to rgb
+    int vw = _mediaState->video_width, vh = _mediaState->video_height;
+    enum AVPixelFormat dst_fmt = AV_PIX_FMT_BGRA;
     _frameRGB = avcodec_alloc_frame();
-    int bytes = avpicture_get_size(AV_PIX_FMT_RGB24, videoCtx->width, videoCtx->height);
+    int bytes = avpicture_get_size(dst_fmt, vw, vh);
     uint8_t *buffer = (uint8_t*)av_malloc(bytes*sizeof(uint8_t));
-    avpicture_fill((AVPicture*)_frameRGB, buffer, AV_PIX_FMT_RGB24, videoCtx->width, videoCtx->height);
+    avpicture_fill((AVPicture*)_frameRGB, buffer, dst_fmt, vw, vh);
 
-    //used to Convert origin frame into RGB24
-    _swsCtx = sws_getContext(videoCtx->width, videoCtx->height, videoCtx->pix_fmt, videoCtx->width,
-                             videoCtx->height, AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL, NULL);
+    //used to Convert origin frame into ARGB
+    //TODO: user opt to choose quality
+    _swsCtx = sws_getContext(videoCtx->width, videoCtx->height, videoCtx->pix_fmt, vw,
+                             vh, dst_fmt, SWS_BILINEAR, NULL, NULL, NULL);
 
 
     if (!_swsCtx) {
         ms_debug("scale context failed from %s to %s\n",
-                 av_get_pix_fmt_name(videoCtx->pix_fmt), av_get_pix_fmt_name(AV_PIX_FMT_RGB24));
+                 av_get_pix_fmt_name(videoCtx->pix_fmt), av_get_pix_fmt_name(dst_fmt));
         err_quit("scale context failed\n");
     }
 }
@@ -400,20 +423,19 @@ VideoThread::VideoThread(MediaState *ms)
 QImage VideoThread::scaleFrame(AVFrame *frame)
 {
     AVCodecContext *videoCtx = _mediaState->video_context;
-
+    int64_t start = av_gettime();
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
               videoCtx->height, (uint8_t *const *)_frameRGB->data, _frameRGB->linesize);
+    ms_debug("scale time: %lld\n", (av_gettime() - start)/1000);
 
-    QImage img(videoCtx->width, videoCtx->height, QImage::Format_RGB888);
+    QImage img(_mediaState->video_width, _mediaState->video_height, QImage::Format_ARGB32);
     uchar *buf = img.bits();
-    memcpy(buf, _frameRGB->data[0], _frameRGB->linesize[0]*videoCtx->height);
+    memcpy(buf, _frameRGB->data[0], _frameRGB->linesize[0]*_mediaState->video_height);
 
-    ms_debug("\tframe: type: %c, pkt_pts: %s, pkt_dts: %s,"
-           "best_effort: %lld, pkt_pos: %lld, key: %d, repeat: %d\n",
-           av_get_picture_type_char(frame->pict_type), av_ts2str(frame->pkt_pts),
-           av_ts2str(frame->pkt_dts),
-           av_frame_get_best_effort_timestamp(frame), av_frame_get_pkt_pos(frame),
-           frame->key_frame, frame->repeat_pict);
+    ms_debug("\tframe: type: %c, w: %d, h: %d, best_effort: %lld, key: %d, repeat: %d\n",
+             av_get_picture_type_char(frame->pict_type), _mediaState->video_width,
+             _mediaState->video_height, av_frame_get_best_effort_timestamp(frame),
+             frame->key_frame, frame->repeat_pict);
 
     return img;
 }
@@ -554,4 +576,3 @@ void AudioThread::run()
     avresample_close(_avrCtx);
     avresample_free(&_avrCtx);
 }
-

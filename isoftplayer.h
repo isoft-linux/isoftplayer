@@ -35,10 +35,15 @@ extern "C" {
 #define MAX_AUDIO_QUEUE_SIZE 4
 #define MAX_PICT_QUEUE_SIZE 1
 
+#define MS_DEBUG
+#ifdef MS_DEBUG
 #define ms_debug(fmt, ...)  do {                                        \
-        av_log(NULL, AV_LOG_INFO, "[%lx]", (long)QThread::currentThread()); \
-        av_log(NULL, AV_LOG_INFO, fmt, ##__VA_ARGS__);                  \
+        av_log(NULL, AV_LOG_DEBUG, "[%lx]", (long)QThread::currentThread()); \
+        av_log(NULL, AV_LOG_DEBUG, fmt, ##__VA_ARGS__);                  \
     } while(0)
+#else
+#define ms_debug(fmt, ...)  do {} while(0)
+#endif
 
 typedef struct MediaState MediaState;
 
@@ -120,6 +125,7 @@ enum MediaStateFlags
     MS_SUBTITLE_DISABLED = 0x04
 };
 
+class MediaPlayer;
 struct MediaState
 {
     const char *media_name;
@@ -136,6 +142,11 @@ struct MediaState
     int debug;
     int quit; // set 1 for quit request
 
+    // real video size displayed, if decoded video frame is different from
+    // this, it needs scaled
+    int video_width;
+    int video_height;
+
     QAudioOutput *output_dev;
     QIODevice *audio_io;
 
@@ -151,6 +162,8 @@ struct MediaState
     double picture_last_delay;
     double picture_last_pts;
     double picture_timer;
+
+    MediaPlayer *player;
 };
 
 void mediastate_close(MediaState *ms);

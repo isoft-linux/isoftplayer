@@ -10,11 +10,10 @@ int main(int argc, char ** argv)
     QApplication app(argc, argv);
 
     av_register_all();
-    // av_log_set_level(AV_LOG_DEBUG);
+    av_log_set_level(AV_LOG_DEBUG);
 
     MediaState *ms = mediastate_init(argv[1]);
-    MediaPlayer player(ms);
-    player.show();
+    ms->player->show();
 
     app.exec();
 
