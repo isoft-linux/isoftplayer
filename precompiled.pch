@@ -1,0 +1,16 @@
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/time.h>
+#include <libavutil/timestamp.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+#include <libavresample/avresample.h>
+
+#if defined __cplusplus
+#include <QtCore/QtCore>
+#include <QtWidgets/QtWidgets>
+#include <QtGui/QtGui>
+#include <QtMultimedia/QtMultimedia>
+#endif

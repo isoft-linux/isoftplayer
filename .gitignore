@@ -1,0 +1,10 @@
+.qmake.cache
+*.swp
+*~
+.*~
+moc_*.cpp
+*.o
+.zcache/
+Makefile
+*.app
+log[0-9]
