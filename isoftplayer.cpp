@@ -42,7 +42,19 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
     }
 
 	AVCodecContext *avctx = ms->format_context->streams[stream_id]->codec;
-	AVCodec *avcodec = avcodec_find_decoder(avctx->codec_id);
+    AVCodec *avcodec = NULL;
+    //TODO: more elegant way to detect codec type and platform to choose best codec
+    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
+#ifdef __APPLE__
+        avcodec = avcodec_find_decoder_by_name("h264_vda");
+#else
+        //TODO: check videocard type
+        avcodec = avcodec_find_decoder_by_name("h264_vdpau");
+#endif
+    }
+    if (!avcodec) {
+        avcodec = avcodec_find_decoder(avctx->codec_id);
+    }
 	if (avcodec == NULL) {
 		err_quit("avcodec_find_decoder failed");
 	}
@@ -51,7 +63,7 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 		err_quit("avcodec_open failed");
 	}
 
-    ms_debug( "open_codec_for_type %d at %d\n", codec_type, stream_id);
+    ms_debug( "open_codec %s for_type %d at %d\n", avcodec->long_name, codec_type, stream_id);
     switch(codec_type) {
     case AVMEDIA_TYPE_VIDEO:
         ms->video_context = avctx;
@@ -168,9 +180,9 @@ MediaState *mediastate_init(const char *filename)
         int linesize = 4608;
         av_samples_get_buffer_size(&linesize, ms->audio_context->channels,
                                    ms->audio_context->sample_rate/8, ms->audio_context->sample_fmt, 1);
-        ms_debug("alloc audio output buffer size: %d\n", linesize);
+        ms_debug("alloc audio output buffer size: %d\n", linesize*2);
         ms->output_dev = new QAudioOutput(info, af);
-        ms->output_dev->setBufferSize(linesize);
+        ms->output_dev->setBufferSize(linesize*2);
         ms->output_dev->setVolume(1.0);
         ms->audio_io = ms->output_dev->start();
     }
@@ -179,7 +191,7 @@ MediaState *mediastate_init(const char *filename)
 }
 
 MediaPlayer::MediaPlayer(MediaState *ms)
-    :QWidget(0), _mediaState(ms)
+    :QWidget(), _mediaState(ms)
 {
     setAttribute(Qt::WA_TranslucentBackground);
     // setAttribute(Qt::WA_OpaquePaintEvent);
@@ -478,33 +490,42 @@ void DecodeThread::run()
 }
 
 VideoThread::VideoThread(MediaState *ms)
-    : QThread(), _mediaState(ms)
+    : QThread(), _mediaState(ms), _swsCtx(0), _last_pix_fmt(ms->video_context->pix_fmt)
+{
+}
+
+void VideoThread::createScaleContext()
 {
     AVCodecContext *videoCtx = _mediaState->video_context;
     const AVCodec *codec = videoCtx->codec;
-    if ((codec->capabilities & CODEC_CAP_HWACCEL)) {
-        ms_debug("hwaccel supported \n");
-    }
-
     if (videoCtx->hwaccel) {
         ms_debug("hwaccel enabled\n");
     }
 
-    //FIXME: if output support yuv420p, then no need to convert to rgb
+    if (_swsCtx) {
+        sws_freeContext(_swsCtx);
+        _swsCtx = NULL;
+    }
+
+    _last_pix_fmt = videoCtx->pix_fmt;
+    ms_debug("scaling video context %s fmt %s\n",
+             videoCtx->codec->long_name, av_get_pix_fmt_name(_last_pix_fmt));
+
+    //FIXME: if output support src pix_fmt, then no need to convert to rgb
     int vw = _mediaState->video_width, vh = _mediaState->video_height;
     enum AVPixelFormat dst_fmt = AV_PIX_FMT_BGRA;
 
     //used to Convert origin frame into ARGB
     //TODO: user opt to choose quality
-    _swsCtx = sws_getContext(videoCtx->width, videoCtx->height, videoCtx->pix_fmt, vw,
+    _swsCtx = sws_getContext(videoCtx->width, videoCtx->height, _last_pix_fmt, vw,
                              vh, dst_fmt, SWS_BILINEAR, NULL, NULL, NULL);
-
 
     if (!_swsCtx) {
         ms_debug("scale context failed from %s to %s\n",
                  av_get_pix_fmt_name(videoCtx->pix_fmt), av_get_pix_fmt_name(dst_fmt));
         err_quit("scale context failed\n");
     }
+
 }
 
 QImage VideoThread::scaleFrame(AVFrame *frame)
@@ -520,16 +541,8 @@ QImage VideoThread::scaleFrame(AVFrame *frame)
     uchar *buf = img.bits();
     int linesizes[4];
     av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
-
-    int64_t start = av_gettime();
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
               videoCtx->height, (uint8_t *const *)&buf, linesizes);
-    ms_debug("scale time: %lld, linesize: %d\n", (av_gettime() - start)/1000, linesizes[0]);
-
-    ms_debug("\tframe: type: %c, w: %d, h: %d, best_effort: %lld, key: %d, repeat: %d\n",
-             av_get_picture_type_char(frame->pict_type), _mediaState->video_width,
-             _mediaState->video_height, av_frame_get_best_effort_timestamp(frame),
-             frame->key_frame, frame->repeat_pict);
 
     return img;
 }
@@ -540,6 +553,7 @@ void VideoThread::run()
     AVCodecContext *videoCtx = _mediaState->video_context;
     AVStream *vs = _mediaState->format_context->streams[_mediaState->video_stream_id];
     AVFrame *frame = avcodec_alloc_frame();
+    createScaleContext();
 
     for (;;) {
         if (_mediaState->quit) {
@@ -556,6 +570,11 @@ void VideoThread::run()
         }
 
         avcodec_decode_video2(videoCtx, frame, &frameFinished, &pkt);
+        if (_last_pix_fmt != videoCtx->pix_fmt) {
+            ms_debug("pix fmt changed, recreate scale context\n");
+            createScaleContext();
+        }
+
         double pts = 0;
         if (frame->pkt_dts != AV_NOPTS_VALUE) {
             pts = frame->pkt_dts;
@@ -566,6 +585,10 @@ void VideoThread::run()
             pts *= av_q2d(vs->time_base);
 
             ms_debug("video pkt: pts: %g, size: %d\n", pts, pkt.size);
+            ms_debug("\tframe: type: %c, w: %d, h: %d, best_effort: %lld, key: %d, repeat: %d\n",
+                     av_get_picture_type_char(frame->pict_type), _mediaState->video_width,
+                     _mediaState->video_height, av_frame_get_best_effort_timestamp(frame),
+                     frame->key_frame, frame->repeat_pict);
             picture_enqueue(&_mediaState->picture_queue, scaleFrame(frame), pts);
             av_free_packet(&pkt);
 

@@ -6,8 +6,8 @@ cache()
 TEMPLATE = app
 TARGET = isoftplayer
 QT_CONFIG -= no-pkg-config
-CONFIG += qt debug link_pkgconfig
-QT += multimedia gui core widgets
+CONFIG += qt debug link_pkgconfig 
+QT += multimedia gui core widgets opengl
 INCLUDEPATH += .
 
 unix|macx {

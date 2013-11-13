@@ -15,6 +15,7 @@ extern "C" {
 }
 
 #include <QtCore/QtCore>
+#include <QtOpenGL/QtOpenGL>
 #include <QtWidgets/QtWidgets>
 #include <QtGui/QtGui>
 #include <QtMultimedia/QtMultimedia>
@@ -75,9 +76,14 @@ public:
 protected:
     void run();
     QImage scaleFrame(AVFrame *frame);
+    void createScaleContext();
 
     MediaState *_mediaState;
     struct SwsContext *_swsCtx;
+    // when I use hardware accelarated decoder (e.g h264_vda), pix_fmt
+    // of video context will change to another (e.g from YUV420p to
+    // UYVY422), so I need to detect that and make a response
+    enum AVPixelFormat _last_pix_fmt;
 };
 
 class AudioThread: public QThread
@@ -180,6 +186,7 @@ struct MediaState
 void mediastate_close(MediaState *ms);
 MediaState *mediastate_init(const char *filename);
 
+//use QGLWidget if possible
 class MediaPlayer: public QWidget
 {
     Q_OBJECT
