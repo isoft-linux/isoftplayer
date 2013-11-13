@@ -28,11 +28,18 @@ extern "C" {
 #define MS_NOSYNC_THRESHOLD 10.0  // in seconds
 
 /**
- * ratio of video queue size to audio queue size should be their frame duration
- * ratio, which makes syncing more elegant.
+ * ratio of video queue size to audio queue size should be their frame
+ * duration ratio, which makes syncing more elegant.
+ *
+ * there is a potential problem here: if audio queue is filled fully
+ * while none of video frames has been decoded, this cause a
+ * wait-forever situtaion.
+ *
+ * TODO: maybe these constants needs to be calculated based on some
+ * facts to keep us away from wait-forever.
  **/
-#define MAX_VIDEO_QUEUE_SIZE 2
-#define MAX_AUDIO_QUEUE_SIZE 4
+#define MAX_VIDEO_QUEUE_SIZE 5
+#define MAX_AUDIO_QUEUE_SIZE 10
 #define MAX_PICT_QUEUE_SIZE 1
 
 #define MS_DEBUG
@@ -70,7 +77,6 @@ protected:
     QImage scaleFrame(AVFrame *frame);
 
     MediaState *_mediaState;
-    AVFrame *_frameRGB;
     struct SwsContext *_swsCtx;
 };
 
@@ -99,6 +105,7 @@ typedef struct PacketQueue_
 PacketQueue packet_queue_init(void *opaque);
 void packet_enqueue(PacketQueue *pq, AVPacket *pkt);
 AVPacket packet_dequeue(PacketQueue *pq);
+void packet_queue_flush(PacketQueue *pq);
 
 typedef struct VideoPicture_
 {
@@ -164,6 +171,10 @@ struct MediaState
     double picture_timer;
 
     MediaPlayer *player;
+
+    double seek_pos; // in seconds
+    int seek_flags;
+    int seek_req;
 };
 
 void mediastate_close(MediaState *ms);
@@ -185,6 +196,7 @@ private slots:
 
 protected:
     void paintEvent(QPaintEvent *pe);
+    void keyPressEvent(QKeyEvent *);
 
 private:
     MediaState *_mediaState;

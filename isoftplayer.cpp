@@ -6,6 +6,9 @@
 
 #include "isoftplayer.h"
 
+#define FLUSH_PKT_DATA "flush"
+static AVPacket flush_pkt = {.data = (unsigned char*)FLUSH_PKT_DATA, .size = sizeof(FLUSH_PKT_DATA) };
+
 static void err_quit(const char *fmt, ...)
 {
     va_list ap;
@@ -19,9 +22,15 @@ static void err_quit(const char *fmt, ...)
 static double get_audio_clock(MediaState *ms)
 {
     //FIXME: should be lock protected ?
-    return ms->audio_clock = (double)ms->output_dev->processedUSecs() / 1000000.0;
+    // return ms->audio_clock = (double)ms->output_dev->processedUSecs() / 1000000.0;
+    return ms->audio_clock;
 }
 
+static double get_master_clock(MediaState *ms)
+{
+    //TODO: add video clock and system clock
+    return get_audio_clock(ms);
+}
 
 
 static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
@@ -103,6 +112,7 @@ void mediastate_close(MediaState *ms)
 
 MediaState *mediastate_init(const char *filename)
 {
+    av_init_packet(&flush_pkt);
     MediaState *ms = (MediaState*)av_mallocz(sizeof(MediaState));
     ms->media_name = strdup(filename);
     if (avformat_open_input(&ms->format_context, ms->media_name, NULL, NULL) != 0) {
@@ -155,8 +165,12 @@ MediaState *mediastate_init(const char *filename)
             af = info.nearestFormat(af);
         }
 
+        int linesize = 4608;
+        av_samples_get_buffer_size(&linesize, ms->audio_context->channels,
+                                   ms->audio_context->sample_rate/8, ms->audio_context->sample_fmt, 1);
+        ms_debug("alloc audio output buffer size: %d\n", linesize);
         ms->output_dev = new QAudioOutput(info, af);
-        ms->output_dev->setBufferSize(192000);
+        ms->output_dev->setBufferSize(linesize);
         ms->output_dev->setVolume(1.0);
         ms->audio_io = ms->output_dev->start();
     }
@@ -194,6 +208,7 @@ MediaPlayer::MediaPlayer(MediaState *ms)
 
 MediaPlayer::~MediaPlayer()
 {
+
 }
 
 void MediaPlayer::run()
@@ -213,7 +228,6 @@ void MediaPlayer::run()
 
 void MediaPlayer::updateDisplay()
 {
-    AVCodecContext *videoCtx = _mediaState->video_context;
     VideoPicture vp = picture_dequeue(&_mediaState->picture_queue);
     QImage frame = vp.frame;
 
@@ -250,8 +264,6 @@ void MediaPlayer::updateDisplay()
 
     _surface = frame;
     update();
-
-    // _mediaState->picture_timer = (double)av_gettime()/1000000.0;
 }
 
 void MediaPlayer::scheduleUpdate(double delay)
@@ -261,8 +273,47 @@ void MediaPlayer::scheduleUpdate(double delay)
 
 void MediaPlayer::paintEvent(QPaintEvent *pe)
 {
+    Q_UNUSED(pe);
     QPainter p(this);
     p.drawImage(0, 0, _surface);
+
+    // QPen pen(Qt::green);
+    // pen.setBrush(QColor(0, 255, 0, 80));
+    // p.setPen(pen);
+
+    // QFont f = p.font();
+    // f.setPointSize(20);
+    // p.setFont(f);
+
+    // QString osd = QString("elapsed: %1").arg(get_master_clock(_mediaState));
+    // p.drawText(20, 20, osd);
+}
+
+void MediaPlayer::keyPressEvent(QKeyEvent * kev)
+{
+    ms_debug("key pressed, modifiers: %d\n", (int)kev->modifiers());
+    int dir = 0;
+    double dur = 0;
+
+        switch(kev->key()) {
+        case Qt::Key_Left: dir = AVSEEK_FLAG_BACKWARD; dur = -10; break;
+        case Qt::Key_Right: dir = 0; dur = 10; break;
+        case Qt::Key_Up: dir = 0; dur = 60; break;
+        case Qt::Key_Down: dir = AVSEEK_FLAG_BACKWARD; dur = -60; break;
+        default:
+            return;
+        }
+
+        if (_mediaState->seek_req) {
+            ms_debug("seeking is occurring\n");
+            return;
+        }
+
+        _mediaState->seek_req = 1;
+        _mediaState->seek_flags = dir;
+        _mediaState->seek_pos = get_master_clock(_mediaState) + dur;
+        ms_debug("request seek_pos: %g\n", _mediaState->seek_pos);
+
 }
 
 PacketQueue packet_queue_init(void *opaque)
@@ -278,7 +329,9 @@ PacketQueue packet_queue_init(void *opaque)
 void packet_enqueue(PacketQueue *pq, AVPacket *pkt)
 {
     QMutexLocker locker(pq->mutex);
-    av_dup_packet(pkt);
+    if (pkt != &flush_pkt)
+        av_dup_packet(pkt);
+
     pq->data->enqueue(*pkt);
     pq->cond->wakeAll();
 }
@@ -295,6 +348,15 @@ AVPacket packet_dequeue(PacketQueue *pq)
     }
 
     return pq->data->dequeue();
+}
+
+void packet_queue_flush(PacketQueue *pq)
+{
+    QMutexLocker locker(pq->mutex);
+    while (pq->data->size()) {
+        AVPacket pkt = pq->data->dequeue();
+        av_free_packet(&pkt);
+    }
 }
 
 PictureQueue picture_queue_init(void *opaque)
@@ -343,18 +405,48 @@ void DecodeThread::run()
     AVPacket packet;
     int ret = 0;
 
-    AVStream *vs = _mediaState->format_context->streams[_mediaState->video_stream_id];
-    av_log(NULL, AV_LOG_INFO, "stream tb: %g, ctx tb: %g\n", av_q2d(vs->time_base),
-           av_q2d(_mediaState->video_context->time_base));
-
     while (1) {
         if (_mediaState->quit) {
             break;
         }
 
+        if (_mediaState->seek_req) {
+            AVStream *stream = NULL;
+            if (_mediaState->video_context) {
+                stream = _mediaState->format_context->streams[_mediaState->video_stream_id];
+            } else if (_mediaState->audio_context) {
+                stream = _mediaState->format_context->streams[_mediaState->audio_stream_id];
+            }
+
+            if (stream) {
+                int64_t seek_target = av_rescale_q((int64_t)(_mediaState->seek_pos*AV_TIME_BASE),
+                                                   AV_TIME_BASE_Q, stream->time_base);
+                ms_debug("seek to target: %lld(%g)\n", seek_target, (double)seek_target*av_q2d(stream->time_base));
+                int ret = av_seek_frame(_mediaState->format_context, stream->index, seek_target,
+                                        _mediaState->seek_flags);
+                if (ret < 0) {
+                    ms_debug("seek failed\n");
+                } else {
+                    //flush and notify
+                    if (_mediaState->video_context) {
+                        packet_queue_flush(&_mediaState->video_queue);
+                        packet_enqueue(&_mediaState->video_queue, &flush_pkt);
+                    }
+
+                    if (_mediaState->audio_context) {
+                        packet_queue_flush(&_mediaState->audio_queue);
+                        packet_enqueue(&_mediaState->audio_queue, &flush_pkt);
+                    }
+                }
+            }
+
+            _mediaState->seek_req = 0;
+        }
+
         if (_mediaState->video_queue.data->size() > MAX_VIDEO_QUEUE_SIZE ||
             _mediaState->audio_queue.data->size() > MAX_AUDIO_QUEUE_SIZE) {
-            av_usleep(100);
+            av_usleep(10000);
+            // ms_debug("queue is full, hold\n");
             continue;
         }
 
@@ -398,14 +490,9 @@ VideoThread::VideoThread(MediaState *ms)
         ms_debug("hwaccel enabled\n");
     }
 
-
     //FIXME: if output support yuv420p, then no need to convert to rgb
     int vw = _mediaState->video_width, vh = _mediaState->video_height;
     enum AVPixelFormat dst_fmt = AV_PIX_FMT_BGRA;
-    _frameRGB = avcodec_alloc_frame();
-    int bytes = avpicture_get_size(dst_fmt, vw, vh);
-    uint8_t *buffer = (uint8_t*)av_malloc(bytes*sizeof(uint8_t));
-    avpicture_fill((AVPicture*)_frameRGB, buffer, dst_fmt, vw, vh);
 
     //used to Convert origin frame into ARGB
     //TODO: user opt to choose quality
@@ -423,14 +510,21 @@ VideoThread::VideoThread(MediaState *ms)
 QImage VideoThread::scaleFrame(AVFrame *frame)
 {
     AVCodecContext *videoCtx = _mediaState->video_context;
+
+    //directly fill qimage data
+    //use ARGB32_Premultiplied is way much faster than ARGB32, which save a conversion
+    //see code here http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
+    //convertARGB32FromARGB32PM is used if not premultiplied.
+    //qt doc (QPainter doc) also recommends this format.
+    QImage img(_mediaState->video_width, _mediaState->video_height, QImage::Format_ARGB32_Premultiplied);
+    uchar *buf = img.bits();
+    int linesizes[4];
+    av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
+
     int64_t start = av_gettime();
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
-              videoCtx->height, (uint8_t *const *)_frameRGB->data, _frameRGB->linesize);
-    ms_debug("scale time: %lld\n", (av_gettime() - start)/1000);
-
-    QImage img(_mediaState->video_width, _mediaState->video_height, QImage::Format_ARGB32);
-    uchar *buf = img.bits();
-    memcpy(buf, _frameRGB->data[0], _frameRGB->linesize[0]*_mediaState->video_height);
+              videoCtx->height, (uint8_t *const *)&buf, linesizes);
+    ms_debug("scale time: %lld, linesize: %d\n", (av_gettime() - start)/1000, linesizes[0]);
 
     ms_debug("\tframe: type: %c, w: %d, h: %d, best_effort: %lld, key: %d, repeat: %d\n",
              av_get_picture_type_char(frame->pict_type), _mediaState->video_width,
@@ -444,7 +538,6 @@ void VideoThread::run()
 {
     int frameFinished = 0;
     AVCodecContext *videoCtx = _mediaState->video_context;
-    const AVCodec *codec = videoCtx->codec;
     AVStream *vs = _mediaState->format_context->streams[_mediaState->video_stream_id];
     AVFrame *frame = avcodec_alloc_frame();
 
@@ -456,6 +549,11 @@ void VideoThread::run()
         AVPacket pkt = packet_dequeue(&_mediaState->video_queue);
         if (!pkt.data)
             continue;
+
+        if (pkt.data == flush_pkt.data) {
+            avcodec_flush_buffers(videoCtx);
+            continue;
+        }
 
         avcodec_decode_video2(videoCtx, frame, &frameFinished, &pkt);
         double pts = 0;
@@ -478,15 +576,12 @@ void VideoThread::run()
 
     avcodec_free_frame(&frame);
     sws_freeContext(_swsCtx);
-    // av_free(buffer);
-    avcodec_free_frame(&_frameRGB);
 }
 
 
 void AudioThread::decode_audio_frames(AVFrame *frame, AVPacket *packet)
 {
     AVCodecContext *audioCtx = _mediaState->audio_context;
-    AVStream *as = _mediaState->format_context->streams[_mediaState->audio_stream_id];
     QIODevice *bufio = _mediaState->audio_io;
 
     int frameFinished = 0;
@@ -503,31 +598,36 @@ void AudioThread::decode_audio_frames(AVFrame *frame, AVPacket *packet)
                 + (avresample_get_delay(_avrCtx) + frame->nb_samples); // upper bound
             uint8_t *out_data = NULL;
             int out_linesize = 0;
-            av_samples_alloc(&out_data, &out_linesize, frame->channels, out_nb_samples, AV_SAMPLE_FMT_S16, 0);
-            int nr_read_samples = avresample_convert(_avrCtx, &out_data, out_linesize, out_nb_samples, frame->data, frame->linesize[0], frame->nb_samples);
+            av_samples_alloc(&out_data, &out_linesize, frame->channels,
+                             out_nb_samples, AV_SAMPLE_FMT_S16, 0);
+            int nr_read_samples = avresample_convert(_avrCtx, &out_data, out_linesize, out_nb_samples,
+                                                     frame->data, frame->linesize[0], frame->nb_samples);
             if (nr_read_samples < out_nb_samples) {
                 ms_debug("still has samples needs to be read\n");
             }
 
             assert(out_linesize == nr_read_samples*4);
             char *inbuf = (char*)out_data;
-            int64_t start = av_gettime();
             do {
-                // qint64 ret = bufio->write((const char*)out_data, (qint64)(nr_read_samples*4));
                 qint64 ret = bufio->write(inbuf, out_linesize);
+                if (ret == -1) {
+                    ms_debug("write to audio buffer error\n");
+                    continue;
+                }
                 bufio->waitForBytesWritten(200);
-                double consumed = (double)ret / (audioCtx->sample_rate * audioCtx->channels * 2);
-                _mediaState->audio_clock += consumed;
 
-                out_linesize -= ret;
-                inbuf += ret;
-
+                if (ret > 0) {
+                    double consumed = (double)ret / (audioCtx->sample_rate * audioCtx->channels * 2);
+                    ms_debug("write %lld bytes, consumed: %g\n", ret, consumed);
+                    _mediaState->audio_clock += consumed;
+                    out_linesize -= ret;
+                    inbuf += ret;
+                }
             } while(out_linesize > 0);
 
             ms_debug("audio frame pts: %s, best effort: %lld, clock: %g, processed secs: %g\n",
                      av_ts2str(frame->pts), av_frame_get_best_effort_timestamp(frame),
                      _mediaState->audio_clock, _mediaState->output_dev->processedUSecs() / 1000000.0);
-            _mediaState->audio_clock = (double)_mediaState->output_dev->processedUSecs() / 1000000.0;
             av_freep(&out_data);
         }
 
@@ -563,7 +663,12 @@ void AudioThread::run()
         if (!pkt.data)
             continue;
 
-        _mediaState->audio_clock = pkt.pts * av_q2d(as->time_base);
+        if (pkt.data == flush_pkt.data) {
+            avcodec_flush_buffers(audioCtx);
+            continue;
+        }
+
+        _mediaState->audio_clock = (double)pkt.pts * av_q2d(as->time_base);
 
         ms_debug("audio pkt: dts: %s, pts: %s, tb: %g, clock: %g\n", av_ts2str(pkt.dts), av_ts2str(pkt.pts),
                  av_q2d(as->time_base), _mediaState->audio_clock);
