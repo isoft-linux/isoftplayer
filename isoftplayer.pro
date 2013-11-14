@@ -3,12 +3,18 @@
 ######################################################################
 cache()
 
+system(which clang++ 1>/dev/null 2>&1) {
+    QMAKE_CXX = clang++
+}
+
 TEMPLATE = app
 TARGET = isoftplayer
 QT_CONFIG -= no-pkg-config
 CONFIG += qt debug link_pkgconfig 
 QT += multimedia gui core widgets opengl
 INCLUDEPATH += .
+
+QMAKE_CXXFLAGS += -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS
 
 unix|macx {
 	CONFIG += link_pkgconfig

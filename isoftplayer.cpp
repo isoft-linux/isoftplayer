@@ -177,12 +177,13 @@ MediaState *mediastate_init(const char *filename)
             af = info.nearestFormat(af);
         }
 
-        int linesize = 4608;
+        int linesize = 8192;
         av_samples_get_buffer_size(&linesize, ms->audio_context->channels,
-                                   ms->audio_context->sample_rate/8, ms->audio_context->sample_fmt, 1);
-        ms_debug("alloc audio output buffer size: %d\n", linesize*2);
+                                   1600, ms->audio_context->sample_fmt, 1);
+        ms_debug("alloc audio output buffer size: %d, context delay: %d\n", linesize,
+                 ms->audio_context->delay);
         ms->output_dev = new QAudioOutput(info, af);
-        ms->output_dev->setBufferSize(linesize*2);
+        ms->output_dev->setBufferSize(linesize);
         ms->output_dev->setVolume(1.0);
         ms->audio_io = ms->output_dev->start();
     }
@@ -194,24 +195,35 @@ MediaPlayer::MediaPlayer(MediaState *ms)
     :QWidget(), _mediaState(ms)
 {
     setAttribute(Qt::WA_TranslucentBackground);
-    // setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_NoSystemBackground);
     setAutoFillBackground(false);
 
     ms->player = this;
     QSize dsize = qApp->desktop()->geometry().size();
-    if (ms->video_context) {
-        QSize vsize(ms->video_context->width, ms->video_context->height);
-        if (vsize.height() > dsize.height() || vsize.width() > dsize.width()) {
-            vsize.scale(dsize, Qt::KeepAspectRatio);
+    AVCodecContext *videoCtx = _mediaState->video_context;
+    QSize vsize(videoCtx->width, videoCtx->height);
+
+    if (videoCtx->width > dsize.width() || videoCtx->height > dsize.height()) {
+        double aspect_ratio = 0.0;
+        if(videoCtx->sample_aspect_ratio.num != 0) {
+            aspect_ratio = av_q2d(videoCtx->sample_aspect_ratio)
+                * videoCtx->width / videoCtx->height;
         }
-        setFixedSize(vsize);
 
-    } else
-        setFixedSize(960, 540);
+        if(aspect_ratio <= 0.0) {
+            aspect_ratio = (double)videoCtx->width / (double)videoCtx->height;
+        }
 
-    ms->video_width = width();
-    ms->video_height = height();
+        vsize = QSize(rint(dsize.height() * aspect_ratio), dsize.height());
+        if (vsize.width() > dsize.width()) {
+            vsize = QSize(dsize.width(), rint(dsize.width() / aspect_ratio));
+        }
+
+    }
+
+    setFixedSize(vsize);
+    ms->video_width = vsize.width();
+    ms->video_height = vsize.height();
 
     move((dsize.width()-width())/2, (dsize.height()-height())/2);
 
@@ -225,7 +237,9 @@ MediaPlayer::~MediaPlayer()
 
 void MediaPlayer::run()
 {
-    _mediaState->decode_thread->start(QThread::IdlePriority);
+    ms_epic_time = (double)av_gettime() / 1000000.0;
+
+    _mediaState->decode_thread->start();
     if (_mediaState->video_context) {
         _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
         _mediaState->video_thread->start();
@@ -645,12 +659,15 @@ void AudioThread::decode_audio_frames(AVFrame *frame, AVPacket *packet)
                     _mediaState->audio_clock += consumed;
                     out_linesize -= ret;
                     inbuf += ret;
+                } else {
+                    QThread::yieldCurrentThread();
                 }
             } while(out_linesize > 0);
 
             ms_debug("audio frame pts: %s, best effort: %lld, clock: %g, processed secs: %g\n",
                      av_ts2str(frame->pts), av_frame_get_best_effort_timestamp(frame),
                      _mediaState->audio_clock, _mediaState->output_dev->processedUSecs() / 1000000.0);
+            // _mediaState->audio_clock = _mediaState->output_dev->processedUSecs() / 1000000.0;
             av_freep(&out_data);
         }
 

@@ -2,6 +2,12 @@
 #define _isoftplayer_h
 
 #if !defined USING_PCH
+
+#ifdef __linux__
+#include <inttypes.h>
+#include <stdint.h>
+#endif
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -43,10 +49,11 @@ extern "C" {
 #define MAX_AUDIO_QUEUE_SIZE 10
 #define MAX_PICT_QUEUE_SIZE 1
 
+static double ms_epic_time = 0;
 #define MS_DEBUG
 #ifdef MS_DEBUG
 #define ms_debug(fmt, ...)  do {                                        \
-        av_log(NULL, AV_LOG_DEBUG, "[%lx]", (long)QThread::currentThread()); \
+        av_log(NULL, AV_LOG_DEBUG, "[%lx][%F]", (long)QThread::currentThread(), (double)(av_gettime() / 1000000.0 - ms_epic_time)); \
         av_log(NULL, AV_LOG_DEBUG, fmt, ##__VA_ARGS__);                  \
     } while(0)
 #else
