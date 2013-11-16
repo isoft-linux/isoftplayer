@@ -6,6 +6,8 @@
 
 #include "isoftplayer.h"
 
+static void ms_audio_callback(void* userdata, Uint8* stream, int len);
+
 #define FLUSH_PKT_DATA "flush"
 static AVPacket flush_pkt = {.data = (unsigned char*)FLUSH_PKT_DATA, .size = sizeof(FLUSH_PKT_DATA) };
 
@@ -22,7 +24,6 @@ static void err_quit(const char *fmt, ...)
 static double get_audio_clock(MediaState *ms)
 {
     //FIXME: should be lock protected ?
-    // return ms->audio_clock = (double)ms->output_dev->processedUSecs() / 1000000.0;
     return ms->audio_clock;
 }
 
@@ -43,14 +44,17 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 
 	AVCodecContext *avctx = ms->format_context->streams[stream_id]->codec;
     AVCodec *avcodec = NULL;
-    //TODO: more elegant way to detect codec type and platform to choose best codec
-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
-#ifdef __APPLE__
-        avcodec = avcodec_find_decoder_by_name("h264_vda");
-#else
-        //TODO: check videocard type
-        avcodec = avcodec_find_decoder_by_name("h264_vdpau");
-#endif
+
+    if (ms->flags & MS_HW_DECODER_PREFERRED) {
+        //TODO: more elegant way to detect codec type and platform to choose best codec
+        if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
+#       ifdef __APPLE__
+            avcodec = avcodec_find_decoder_by_name("h264_vda");
+#       else
+            //TODO: check videocard type
+            avcodec = avcodec_find_decoder_by_name("h264_vdpau");
+#       endif
+        }
     }
     if (!avcodec) {
         avcodec = avcodec_find_decoder(avctx->codec_id);
@@ -105,13 +109,19 @@ void mediastate_close(MediaState *ms)
 
     if (ms->audio_context) {
         ms->audio_queue.cond->wakeAll();
-        ms->audio_thread->wait();
-        ms_debug("delete audio_thread\n");
 
         avcodec_close(ms->audio_context);
         delete ms->audio_queue.mutex;
         delete ms->audio_queue.cond;
         delete ms->audio_queue.data;
+
+        av_frame_free(&ms->audio_frame);
+
+        avresample_close(ms->avrCtx);
+        avresample_free(&ms->avrCtx);
+
+        SDL_CloseAudioDevice(ms->audio_dev_id);
+        SDL_Quit();
     }
 
     ms->decode_thread->wait();
@@ -159,33 +169,62 @@ MediaState *mediastate_init(const char *filename)
     }
 
     if (ms->audio_context) {
-        ms->audio_thread = new AudioThread(ms);
         ms->audio_queue = packet_queue_init((void*)ms);
 
-        QAudioFormat af;
-        //S16P
-        af.setChannelCount(ms->audio_context->channels);
-        af.setSampleSize(16);
-        af.setSampleType(QAudioFormat::SignedInt);
-        af.setSampleRate(ms->audio_context->sample_rate);
-        af.setCodec("audio/pcm");
-        af.setByteOrder(QAudioFormat::LittleEndian);
+        AVCodecContext *audioCtx = ms->audio_context;
+        if (SDL_Init(SDL_INIT_AUDIO) < 0) {
+            ms_debug("sdl init failed: %s\n", SDL_GetError());
 
-        QAudioDeviceInfo info(QAudioDeviceInfo::defaultOutputDevice());
-        if (!info.isFormatSupported(af)) {
-            ms_debug("Default format not supported - trying to use nearest");
-            af = info.nearestFormat(af);
+        } else {
+            SDL_AudioSpec req_spec, real_spec;
+
+            ms->audio_dst_fmt = AV_SAMPLE_FMT_S16;
+            // ms->audio_dst_chl = AV_CH_LAYOUT_STEREO;
+            ms->audio_dst_chl = audioCtx->channel_layout;
+
+            SDL_zero(req_spec);
+            req_spec.freq = audioCtx->sample_rate;
+            req_spec.format = AUDIO_S16SYS;
+            req_spec.channels = av_get_channel_layout_nb_channels(ms->audio_dst_chl);
+            req_spec.samples = 1024;
+            req_spec.silence = 0;
+            req_spec.callback = ms_audio_callback;
+            req_spec.userdata = (void *)ms;
+            ms->audio_dev_id = SDL_OpenAudioDevice(NULL, 0, &req_spec, &real_spec, 0);
+            if (ms->audio_dev_id == 0) {
+                ms_debug("open audio device failed: %s\n", SDL_GetError());
+            }
+
+            if (real_spec.channels != av_get_channel_layout_nb_channels(ms->audio_dst_chl)) {
+                ms_debug("channels changed from %d to %d\n",
+                         av_get_channel_layout_nb_channels(ms->audio_dst_chl), real_spec.channels);
+            }
+
+            if (real_spec.format != AUDIO_S16SYS) {
+                ms_debug("sdl does not agree with format s16sys\n");
+            }
+
+            if (real_spec.freq != audioCtx->sample_rate) {
+                ms_debug("sdl sample_rate does not agree with ours\n");
+            }
+
+            ms->audio_frame = avcodec_alloc_frame();
+
+            char buf[1024];
+            av_get_channel_layout_string(buf, sizeof(buf)-1, -1,
+                                         audioCtx->channel_layout);
+            ms_debug("origin audio chl: %s, channels: %d\n", buf, audioCtx->channels);
+
+            ms->avrCtx = avresample_alloc_context();
+            //TODO: check endian
+            av_opt_set_int(ms->avrCtx, "in_channel_layout", audioCtx->channel_layout, 0);
+            av_opt_set_int(ms->avrCtx, "in_sample_fmt", audioCtx->sample_fmt, 0);
+            av_opt_set_int(ms->avrCtx, "in_sample_rate", audioCtx->sample_rate, 0);
+            av_opt_set_int(ms->avrCtx, "out_channel_layout", ms->audio_dst_chl, 0);
+            av_opt_set_int(ms->avrCtx, "out_sample_fmt", ms->audio_dst_fmt, 0);
+            av_opt_set_int(ms->avrCtx, "out_sample_rate", audioCtx->sample_rate, 0);
+            avresample_open(ms->avrCtx);
         }
-
-        int linesize = 8192;
-        av_samples_get_buffer_size(&linesize, ms->audio_context->channels,
-                                   1600, ms->audio_context->sample_fmt, 1);
-        ms_debug("alloc audio output buffer size: %d, context delay: %d\n", linesize,
-                 ms->audio_context->delay);
-        ms->output_dev = new QAudioOutput(info, af);
-        ms->output_dev->setBufferSize(linesize);
-        ms->output_dev->setVolume(1.0);
-        ms->audio_io = ms->output_dev->start();
     }
 
     return ms;
@@ -246,8 +285,10 @@ void MediaPlayer::run()
 
     }
 
-    if (_mediaState->audio_context)
-        _mediaState->audio_thread->start();
+    if (_mediaState->audio_context) {
+        SDL_PauseAudioDevice(_mediaState->audio_dev_id, 0);
+    }
+
 
     updateDisplay();
 }
@@ -430,6 +471,7 @@ void DecodeThread::run()
 {
     AVPacket packet;
     int ret = 0;
+    static int total_frame_num = 0;
 
     while (1) {
         if (_mediaState->quit) {
@@ -472,7 +514,8 @@ void DecodeThread::run()
         if (_mediaState->video_queue.data->size() > MAX_VIDEO_QUEUE_SIZE ||
             _mediaState->audio_queue.data->size() > MAX_AUDIO_QUEUE_SIZE) {
             av_usleep(10000);
-            // ms_debug("queue is full, hold\n");
+            ms_debug("queue is full, hold\n");
+            QThread::yieldCurrentThread();
             continue;
         }
 
@@ -488,9 +531,11 @@ void DecodeThread::run()
         }
 
         if (packet.stream_index == _mediaState->video_stream_id) {
+            ms_debug("read_frame #%d, video frame\n", ++total_frame_num);
             packet_enqueue(&_mediaState->video_queue, &packet);
 
         } else if (packet.stream_index == _mediaState->audio_stream_id) {
+            ms_debug("read_frame #%d, audio frame\n", ++total_frame_num);
             packet_enqueue(&_mediaState->audio_queue, &packet);
 
         } else {
@@ -546,6 +591,7 @@ QImage VideoThread::scaleFrame(AVFrame *frame)
 {
     AVCodecContext *videoCtx = _mediaState->video_context;
 
+    int64_t start = av_gettime();
     //directly fill qimage data
     //use ARGB32_Premultiplied is way much faster than ARGB32, which save a conversion
     //see code here http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
@@ -557,7 +603,7 @@ QImage VideoThread::scaleFrame(AVFrame *frame)
     av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
               videoCtx->height, (uint8_t *const *)&buf, linesizes);
-
+    ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / 1000000.0);
     return img;
 }
 
@@ -615,109 +661,129 @@ void VideoThread::run()
     sws_freeContext(_swsCtx);
 }
 
-
-void AudioThread::decode_audio_frames(AVFrame *frame, AVPacket *packet)
+static int decode_audio_frame(MediaState *ms)
 {
-    AVCodecContext *audioCtx = _mediaState->audio_context;
-    QIODevice *bufio = _mediaState->audio_io;
+    AVCodecContext *audioCtx = ms->audio_context;
+    AVStream *as = ms->format_context->streams[ms->audio_stream_id];
+    int delayed_frame = 0, flush_done = 0;
 
-    int frameFinished = 0;
-    int packet_size = packet->size;
     for (;;) {
-        int nr_read = avcodec_decode_audio4(audioCtx, frame, &frameFinished, packet);
-        if (nr_read < 0) {
-            return;
-        }
-
-        packet_size -= nr_read;
-        if (frameFinished) {
-            int out_nb_samples = avresample_available(_avrCtx)
-                + (avresample_get_delay(_avrCtx) + frame->nb_samples); // upper bound
-            uint8_t *out_data = NULL;
-            int out_linesize = 0;
-            av_samples_alloc(&out_data, &out_linesize, frame->channels,
-                             out_nb_samples, AV_SAMPLE_FMT_S16, 0);
-            int nr_read_samples = avresample_convert(_avrCtx, &out_data, out_linesize, out_nb_samples,
-                                                     frame->data, frame->linesize[0], frame->nb_samples);
-            if (nr_read_samples < out_nb_samples) {
-                ms_debug("still has samples needs to be read\n");
+        while (ms->audio_pkt_temp.size > 0 || (!ms->audio_pkt_temp.data && delayed_frame) ) {
+            int frameFinished = 0;
+            //TODO: maybe wee need a flush buffer call by setting pkt.data = NULL?
+            int nr_read = avcodec_decode_audio4(audioCtx, ms->audio_frame,
+                                                &frameFinished, &ms->audio_pkt);
+            if (nr_read < 0) {
+                ms->audio_pkt_temp.size = 0;
+                return -1;
             }
 
-            assert(out_linesize == nr_read_samples*4);
-            char *inbuf = (char*)out_data;
-            do {
-                qint64 ret = bufio->write(inbuf, out_linesize);
-                if (ret == -1) {
-                    ms_debug("write to audio buffer error\n");
-                    continue;
+            if (!frameFinished) {
+                if (!ms->audio_pkt_temp.data && (audioCtx->codec->capabilities & CODEC_CAP_DELAY)) {
+                    flush_done = 1;
+                    delayed_frame = 0;
+                    ms_debug("flush for decode_audio4 done\n");
+                    break;
                 }
-                bufio->waitForBytesWritten(200);
+            }
 
-                if (ret > 0) {
-                    double consumed = (double)ret / (audioCtx->sample_rate * audioCtx->channels * 2);
-                    ms_debug("write %lld bytes, consumed: %g\n", ret, consumed);
-                    _mediaState->audio_clock += consumed;
-                    out_linesize -= ret;
-                    inbuf += ret;
-                } else {
-                    QThread::yieldCurrentThread();
+            ms->audio_pkt_temp.size -= nr_read;
+            if (ms->audio_pkt_temp.data)
+                ms->audio_pkt_temp.data += nr_read;
+
+            if (ms->audio_pkt_temp.size <= 0 && (audioCtx->codec->capabilities & CODEC_CAP_DELAY)) {
+                if (!delayed_frame) {
+                    ms->audio_pkt_temp.data = NULL;
+                    delayed_frame = 1;
+                    ms_debug("need a flush call for decode_audio4\n");
                 }
-            } while(out_linesize > 0);
+            }
 
-            ms_debug("audio frame pts: %s, best effort: %lld, clock: %g, processed secs: %g\n",
-                     av_ts2str(frame->pts), av_frame_get_best_effort_timestamp(frame),
-                     _mediaState->audio_clock, _mediaState->output_dev->processedUSecs() / 1000000.0);
-            // _mediaState->audio_clock = _mediaState->output_dev->processedUSecs() / 1000000.0;
-            av_freep(&out_data);
+            if (frameFinished) {
+                if (ms->audio_buf) {
+                    av_freep(&ms->audio_buf);
+                    ms->audio_buf_index = 0;
+                    ms->audio_buf_size = 0;
+                }
+
+                int out_nb_samples = avresample_available(ms->avrCtx)
+                    + (avresample_get_delay(ms->avrCtx) + ms->audio_frame->nb_samples);
+
+                int dst_channels = av_get_channel_layout_nb_channels(ms->audio_dst_chl);
+                av_samples_alloc(&ms->audio_buf, &ms->audio_buf_size, dst_channels,
+                                 out_nb_samples, ms->audio_dst_fmt, 1);
+                int nr_read_samples = avresample_convert(
+                    ms->avrCtx, &ms->audio_buf, ms->audio_buf_size, out_nb_samples,
+                    ms->audio_frame->data, ms->audio_frame->linesize[0], ms->audio_frame->nb_samples);
+                if (nr_read_samples < out_nb_samples) {
+                    ms_debug("still has samples needs to be read\n");
+                }
+
+                ms_debug("audio decode read %d, fill audio_buf of size %d\n",
+                         nr_read, ms->audio_buf_size);
+                return nr_read;
+            }
+        } //~while
+
+        if (ms->audio_pkt.data) {
+            av_free_packet(&ms->audio_pkt);
         }
 
-        if (packet_size <= 0) {
-            return;
+        if (ms->quit) {
+            return -1;
         }
 
-        ms_debug("more frames from packet\n");
-    }
-}
+        ms->audio_pkt = packet_dequeue(&ms->audio_queue);
+        if (!ms->audio_pkt.data)
+            return -1;
 
-void AudioThread::run()
-{
-    AVCodecContext *audioCtx = _mediaState->audio_context;
-    AVStream *as = _mediaState->format_context->streams[_mediaState->audio_stream_id];
-    AVFrame *frame = avcodec_alloc_frame();
-
-    _avrCtx = avresample_alloc_context();
-    av_opt_set_int(_avrCtx, "in_channel_layout", audioCtx->channel_layout, 0);
-    av_opt_set_int(_avrCtx, "in_sample_fmt", audioCtx->sample_fmt, 0);
-    av_opt_set_int(_avrCtx, "in_sample_rate", audioCtx->sample_rate, 0);
-    av_opt_set_int(_avrCtx, "out_channel_layout", audioCtx->channel_layout, 0);
-    av_opt_set_int(_avrCtx, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-    av_opt_set_int(_avrCtx, "out_sample_rate", audioCtx->sample_rate, 0);
-    avresample_open(_avrCtx);
-
-    for (;;) {
-        if (_mediaState->quit) {
-            break;
-        }
-
-        AVPacket pkt = packet_dequeue(&_mediaState->audio_queue);
-        if (!pkt.data)
-            continue;
-
-        if (pkt.data == flush_pkt.data) {
+        if (ms->audio_pkt.data == flush_pkt.data) {
             avcodec_flush_buffers(audioCtx);
             continue;
         }
 
-        _mediaState->audio_clock = (double)pkt.pts * av_q2d(as->time_base);
+        ms->audio_pkt_temp = ms->audio_pkt;
+        // ms->audio_pkt_size = ms->audio_pkt.size;
+        ms->audio_clock = (double)ms->audio_pkt.pts * av_q2d(as->time_base);
 
-        ms_debug("audio pkt: dts: %s, pts: %s, tb: %g, clock: %g\n", av_ts2str(pkt.dts), av_ts2str(pkt.pts),
-                 av_q2d(as->time_base), _mediaState->audio_clock);
+        ms_debug("audio pkt: dts: %s, pts: %s, tb: %g, clock: %g\n",
+                 av_ts2str(ms->audio_pkt.dts), av_ts2str(ms->audio_pkt.pts), av_q2d(as->time_base), ms->audio_clock);
 
-        decode_audio_frames(frame, &pkt);
-        av_free_packet(&pkt);
     }
+}
 
-    av_frame_free(&frame);
-    avresample_close(_avrCtx);
-    avresample_free(&_avrCtx);
+void ms_audio_callback(void* userdata, Uint8* stream, int len)
+{
+    MediaState *ms = (MediaState *)userdata;
+
+    AVCodecContext *audioCtx = ms->audio_context;
+    AVStream *as = ms->format_context->streams[ms->audio_stream_id];
+
+
+    while(len) {
+        ms_debug("sdl buf len: %d, audio_callback: buf_index: %d, buf_size: %d\n",
+                 len, ms->audio_buf_index, ms->audio_buf_size);
+        if (ms->audio_buf_index >= ms->audio_buf_size) {
+            int data_size = decode_audio_frame(ms);
+            if (data_size < 0) {
+                memset(stream, 0, len);
+                ms_debug("fill silence data\n");
+                break;
+            }
+        }
+
+        int len1 = FFMIN(ms->audio_buf_size - ms->audio_buf_index, len);
+        memcpy(stream, ms->audio_buf + ms->audio_buf_index, len1);
+
+        int bytes_per_sec = 0;
+        av_samples_get_buffer_size(&bytes_per_sec, ms->audio_dst_chl,
+                                   audioCtx->sample_rate, ms->audio_dst_fmt, 1);
+        double consumed = (double)len1 / bytes_per_sec;
+        ms->audio_clock += consumed;
+        ms_debug("write %d bytes, bytes_per_sec: %d, consumed: %g, audio_clock: %g\n",
+                 len1, bytes_per_sec, consumed, ms->audio_clock);
+
+        ms->audio_buf_index += len1;
+        len -= len1;
+    }
 }

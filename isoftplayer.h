@@ -20,11 +20,12 @@ extern "C" {
 #include <libavresample/avresample.h>
 }
 
+#include <SDL2/SDL.h>
+
 #include <QtCore/QtCore>
 #include <QtOpenGL/QtOpenGL>
 #include <QtWidgets/QtWidgets>
 #include <QtGui/QtGui>
-#include <QtMultimedia/QtMultimedia>
 
 #else
 #warning "using precompiled pch"
@@ -45,9 +46,9 @@ extern "C" {
  * TODO: maybe these constants needs to be calculated based on some
  * facts to keep us away from wait-forever.
  **/
-#define MAX_VIDEO_QUEUE_SIZE 5
-#define MAX_AUDIO_QUEUE_SIZE 10
-#define MAX_PICT_QUEUE_SIZE 1
+#define MAX_VIDEO_QUEUE_SIZE 10
+#define MAX_AUDIO_QUEUE_SIZE 20
+#define MAX_PICT_QUEUE_SIZE 2
 
 static double ms_epic_time = 0;
 #define MS_DEBUG
@@ -93,20 +94,6 @@ protected:
     enum AVPixelFormat _last_pix_fmt;
 };
 
-class AudioThread: public QThread
-{
-public:
-    AudioThread(MediaState *ms)
-        :QThread(), _mediaState(ms) {}
-
-protected:
-    void run();
-    void decode_audio_frames(AVFrame *frame, AVPacket *packet);
-
-    AVAudioResampleContext *_avrCtx;
-    MediaState *_mediaState;
-};
-
 typedef struct PacketQueue_
 {
     QMutex *mutex;
@@ -142,7 +129,9 @@ enum MediaStateFlags
 {
     MS_AUDIO_DISABLED = 0x01,
     MS_VIDEO_DISABLED = 0x02,
-    MS_SUBTITLE_DISABLED = 0x04
+    MS_SUBTITLE_DISABLED = 0x04,
+
+    MS_HW_DECODER_PREFERRED = 0x08
 };
 
 class MediaPlayer;
@@ -167,12 +156,21 @@ struct MediaState
     int video_width;
     int video_height;
 
-    QAudioOutput *output_dev;
-    QIODevice *audio_io;
+    SDL_AudioDeviceID audio_dev_id;
+    AVAudioResampleContext *avrCtx;
+    AVFrame *audio_frame;
+
+    uint8_t *audio_buf;
+    int audio_buf_size;
+    int audio_buf_index;
+
+    AVPacket audio_pkt;
+    AVPacket audio_pkt_temp; // who's data field may be alerted due to flush
+    AVSampleFormat audio_dst_fmt;
+    int audio_dst_chl; // layout
 
     QThread *decode_thread;
     VideoThread *video_thread;
-    AudioThread *audio_thread;
 
     PacketQueue video_queue;
     PacketQueue audio_queue;

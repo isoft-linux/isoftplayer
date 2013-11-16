@@ -11,14 +11,14 @@ TEMPLATE = app
 TARGET = isoftplayer
 QT_CONFIG -= no-pkg-config
 CONFIG += qt debug link_pkgconfig 
-QT += multimedia gui core widgets opengl
+QT += gui core widgets opengl
 INCLUDEPATH += .
 
 QMAKE_CXXFLAGS += -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS
 
 unix|macx {
 	CONFIG += link_pkgconfig
-	PKGCONFIG += libavcodec libavutil libavresample libavformat libswscale
+	PKGCONFIG += libavcodec libavutil libavresample libavformat libswscale sdl2
 	packagesExist(libavcodec) {
 		DEFINES += HAS_AVCODEC
 	}
