@@ -18,7 +18,7 @@ QMAKE_CXXFLAGS += -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS
 
 unix|macx {
 	CONFIG += link_pkgconfig
-	PKGCONFIG += libavcodec libavutil libavresample libavformat libswscale sdl2
+	PKGCONFIG += libavcodec libavutil libswresample libavformat libswscale sdl2
 	packagesExist(libavcodec) {
 		DEFINES += HAS_AVCODEC
 	}

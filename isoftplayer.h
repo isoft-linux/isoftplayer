@@ -17,7 +17,7 @@ extern "C" {
 #include <libavutil/timestamp.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
-#include <libavresample/avresample.h>
+#include <libswresample/swresample.h>
 }
 
 #include <SDL2/SDL.h>
@@ -157,7 +157,10 @@ struct MediaState
     int video_height;
 
     SDL_AudioDeviceID audio_dev_id;
-    AVAudioResampleContext *avrCtx;
+    SwrContext *swrCtx;
+    AVSampleFormat audio_dst_fmt;
+    int audio_dst_chl; // layout
+    int audio_dst_rate; // sample rate
     AVFrame *audio_frame;
 
     uint8_t *audio_buf;
@@ -166,8 +169,6 @@ struct MediaState
 
     AVPacket audio_pkt;
     AVPacket audio_pkt_temp; // who's data field may be alerted due to flush
-    AVSampleFormat audio_dst_fmt;
-    int audio_dst_chl; // layout
 
     QThread *decode_thread;
     VideoThread *video_thread;

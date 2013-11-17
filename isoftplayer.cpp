@@ -117,8 +117,7 @@ void mediastate_close(MediaState *ms)
 
         av_frame_free(&ms->audio_frame);
 
-        avresample_close(ms->avrCtx);
-        avresample_free(&ms->avrCtx);
+        swr_free(&ms->swrCtx);
 
         SDL_CloseAudioDevice(ms->audio_dev_id);
         SDL_Quit();
@@ -179,14 +178,17 @@ MediaState *mediastate_init(const char *filename)
             SDL_AudioSpec req_spec, real_spec;
 
             ms->audio_dst_fmt = AV_SAMPLE_FMT_S16;
-            // ms->audio_dst_chl = AV_CH_LAYOUT_STEREO;
-            ms->audio_dst_chl = audioCtx->channel_layout;
+            // TODO: if origin chlayout is more than stereo, downmixing is better now,
+            // I need to check if hardware support origin layout before downmixing.
+            ms->audio_dst_chl = AV_CH_LAYOUT_STEREO;
+            // ms->audio_dst_chl = audioCtx->channel_layout;
+            ms->audio_dst_rate = audioCtx->sample_rate;
 
             SDL_zero(req_spec);
             req_spec.freq = audioCtx->sample_rate;
             req_spec.format = AUDIO_S16SYS;
             req_spec.channels = av_get_channel_layout_nb_channels(ms->audio_dst_chl);
-            req_spec.samples = 1024;
+            req_spec.samples = 4096;
             req_spec.silence = 0;
             req_spec.callback = ms_audio_callback;
             req_spec.userdata = (void *)ms;
@@ -215,15 +217,15 @@ MediaState *mediastate_init(const char *filename)
                                          audioCtx->channel_layout);
             ms_debug("origin audio chl: %s, channels: %d\n", buf, audioCtx->channels);
 
-            ms->avrCtx = avresample_alloc_context();
+            ms->swrCtx = swr_alloc();
             //TODO: check endian
-            av_opt_set_int(ms->avrCtx, "in_channel_layout", audioCtx->channel_layout, 0);
-            av_opt_set_int(ms->avrCtx, "in_sample_fmt", audioCtx->sample_fmt, 0);
-            av_opt_set_int(ms->avrCtx, "in_sample_rate", audioCtx->sample_rate, 0);
-            av_opt_set_int(ms->avrCtx, "out_channel_layout", ms->audio_dst_chl, 0);
-            av_opt_set_int(ms->avrCtx, "out_sample_fmt", ms->audio_dst_fmt, 0);
-            av_opt_set_int(ms->avrCtx, "out_sample_rate", audioCtx->sample_rate, 0);
-            avresample_open(ms->avrCtx);
+            av_opt_set_int(ms->swrCtx, "in_channel_layout", audioCtx->channel_layout, 0);
+            av_opt_set_int(ms->swrCtx, "in_sample_fmt", audioCtx->sample_fmt, 0);
+            av_opt_set_int(ms->swrCtx, "in_sample_rate", audioCtx->sample_rate, 0);
+            av_opt_set_int(ms->swrCtx, "out_channel_layout", ms->audio_dst_chl, 0);
+            av_opt_set_int(ms->swrCtx, "out_sample_fmt", ms->audio_dst_fmt, 0);
+            av_opt_set_int(ms->swrCtx, "out_sample_rate", audioCtx->sample_rate, 0);
+            swr_init(ms->swrCtx);
         }
     }
 
@@ -706,21 +708,21 @@ static int decode_audio_frame(MediaState *ms)
                     ms->audio_buf_size = 0;
                 }
 
-                int out_nb_samples = avresample_available(ms->avrCtx)
-                    + (avresample_get_delay(ms->avrCtx) + ms->audio_frame->nb_samples);
 
+                int out_nb_samples = av_rescale_rnd(
+                    swr_get_delay(ms->swrCtx, audioCtx->sample_rate) + ms->audio_frame->nb_samples,
+                    ms->audio_dst_rate, audioCtx->sample_rate, AV_ROUND_UP) + 256;
                 int dst_channels = av_get_channel_layout_nb_channels(ms->audio_dst_chl);
                 av_samples_alloc(&ms->audio_buf, &ms->audio_buf_size, dst_channels,
                                  out_nb_samples, ms->audio_dst_fmt, 1);
-                int nr_read_samples = avresample_convert(
-                    ms->avrCtx, &ms->audio_buf, ms->audio_buf_size, out_nb_samples,
-                    ms->audio_frame->data, ms->audio_frame->linesize[0], ms->audio_frame->nb_samples);
-                if (nr_read_samples < out_nb_samples) {
-                    ms_debug("still has samples needs to be read\n");
-                }
 
-                ms_debug("audio decode read %d, fill audio_buf of size %d\n",
-                         nr_read, ms->audio_buf_size);
+                out_nb_samples = swr_convert(
+                    ms->swrCtx, &ms->audio_buf, out_nb_samples,
+                    (const uint8_t **)ms->audio_frame->extended_data, ms->audio_frame->nb_samples);
+
+                ms->audio_buf_size = av_samples_get_buffer_size(NULL, dst_channels, out_nb_samples, ms->audio_dst_fmt, 0);
+                ms_debug("nb_samples: %d, out_nb_samples: %d, audio decode read %d, fill audio_buf of size %d\n",
+                         ms->audio_frame->nb_samples, out_nb_samples, nr_read, ms->audio_buf_size);
                 return nr_read;
             }
         } //~while
@@ -743,11 +745,11 @@ static int decode_audio_frame(MediaState *ms)
         }
 
         ms->audio_pkt_temp = ms->audio_pkt;
-        // ms->audio_pkt_size = ms->audio_pkt.size;
         ms->audio_clock = (double)ms->audio_pkt.pts * av_q2d(as->time_base);
 
-        ms_debug("audio pkt: dts: %s, pts: %s, tb: %g, clock: %g\n",
-                 av_ts2str(ms->audio_pkt.dts), av_ts2str(ms->audio_pkt.pts), av_q2d(as->time_base), ms->audio_clock);
+        ms_debug("audio pkt: size: %d, dts: %s, pts: %s, tb: %g, clock: %g\n",
+                 ms->audio_pkt.size, av_ts2str(ms->audio_pkt.dts),
+                 av_ts2str(ms->audio_pkt.pts), av_q2d(as->time_base), ms->audio_clock);
 
     }
 }
@@ -759,8 +761,7 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
     AVCodecContext *audioCtx = ms->audio_context;
     AVStream *as = ms->format_context->streams[ms->audio_stream_id];
 
-
-    while(len) {
+    while(len > 0) {
         ms_debug("sdl buf len: %d, audio_callback: buf_index: %d, buf_size: %d\n",
                  len, ms->audio_buf_index, ms->audio_buf_size);
         if (ms->audio_buf_index >= ms->audio_buf_size) {
@@ -768,6 +769,7 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
             if (data_size < 0) {
                 memset(stream, 0, len);
                 ms_debug("fill silence data\n");
+                len = 0;
                 break;
             }
         }
@@ -775,15 +777,16 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
         int len1 = FFMIN(ms->audio_buf_size - ms->audio_buf_index, len);
         memcpy(stream, ms->audio_buf + ms->audio_buf_index, len1);
 
-        int bytes_per_sec = 0;
-        av_samples_get_buffer_size(&bytes_per_sec, ms->audio_dst_chl,
-                                   audioCtx->sample_rate, ms->audio_dst_fmt, 1);
+        int bytes_per_sec = av_samples_get_buffer_size(
+            NULL, av_get_channel_layout_nb_channels(ms->audio_dst_chl),
+            audioCtx->sample_rate, ms->audio_dst_fmt, 1);
         double consumed = (double)len1 / bytes_per_sec;
         ms->audio_clock += consumed;
         ms_debug("write %d bytes, bytes_per_sec: %d, consumed: %g, audio_clock: %g\n",
                  len1, bytes_per_sec, consumed, ms->audio_clock);
 
         ms->audio_buf_index += len1;
+        stream += len1;
         len -= len1;
     }
 }
