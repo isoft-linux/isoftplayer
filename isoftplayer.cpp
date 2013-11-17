@@ -33,6 +33,37 @@ static double get_master_clock(MediaState *ms)
     return get_audio_clock(ms);
 }
 
+static void adjust_queue_ratio(MediaState *ms)
+{
+    if (ms->audio_context && ms->video_context) {
+        AVStream *as = ms->format_context->streams[ms->audio_stream_id];
+        AVStream *vs = ms->format_context->streams[ms->video_stream_id];
+        int base = FFMIN(DEFAULT_MAX_VIDEO_QUEUE_SIZE, DEFAULT_MAX_AUDIO_QUEUE_SIZE);
+
+        int nb_audio_frames, nb_video_frames;
+        if (as->nb_frames && vs->nb_frames) {
+            nb_audio_frames = as->nb_frames;
+            nb_video_frames = vs->nb_frames;
+        } else {
+            // guess
+            nb_audio_frames = ms->nb_audio_frames;
+            nb_video_frames = ms->nb_video_frames;
+        }
+
+        float ratio = (float)nb_audio_frames / nb_video_frames;
+        if (ratio > 1.0) {
+            ms->max_audio_queue_size = ceil(ratio * base);
+            ms->max_video_queue_size = base;
+        } else {
+            ms->max_audio_queue_size = base;
+            ms->max_video_queue_size = ceil(ratio * base);
+        }
+
+        ms_debug("adjust_queue_ratio: as:frames: %d, vs:frames: %d, base: %d, aqz: %d, vqz: %d\n",
+                 nb_audio_frames, nb_video_frames, base,
+                 ms->max_audio_queue_size, ms->max_video_queue_size);
+    }
+}
 
 static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 {
@@ -183,12 +214,13 @@ MediaState *mediastate_init(const char *filename)
             ms->audio_dst_chl = AV_CH_LAYOUT_STEREO;
             // ms->audio_dst_chl = audioCtx->channel_layout;
             ms->audio_dst_rate = audioCtx->sample_rate;
+            ms->audio_sdl_fmt = AUDIO_S16SYS;
 
             SDL_zero(req_spec);
             req_spec.freq = audioCtx->sample_rate;
-            req_spec.format = AUDIO_S16SYS;
+            req_spec.format = ms->audio_sdl_fmt;
             req_spec.channels = av_get_channel_layout_nb_channels(ms->audio_dst_chl);
-            req_spec.samples = 4096;
+            req_spec.samples = 1024; // this shouldn't too large, so audio_clock would be a little more accurate
             req_spec.silence = 0;
             req_spec.callback = ms_audio_callback;
             req_spec.userdata = (void *)ms;
@@ -202,7 +234,7 @@ MediaState *mediastate_init(const char *filename)
                          av_get_channel_layout_nb_channels(ms->audio_dst_chl), real_spec.channels);
             }
 
-            if (real_spec.format != AUDIO_S16SYS) {
+            if (real_spec.format != ms->audio_sdl_fmt) {
                 ms_debug("sdl does not agree with format s16sys\n");
             }
 
@@ -228,6 +260,10 @@ MediaState *mediastate_init(const char *filename)
             swr_init(ms->swrCtx);
         }
     }
+
+    ms->max_pict_queue_size = DEFAULT_MAX_PICT_QUEUE_SIZE;
+    ms->max_video_queue_size = DEFAULT_MAX_VIDEO_QUEUE_SIZE;
+    ms->max_audio_queue_size = DEFAULT_MAX_AUDIO_QUEUE_SIZE;
 
     return ms;
 }
@@ -442,7 +478,7 @@ void picture_enqueue(PictureQueue *pq, QImage frame, double pts)
 {
     MediaState *ms = (MediaState*)pq->opaque;
     QMutexLocker locker(pq->mutex);
-    while (pq->data->size() >= MAX_PICT_QUEUE_SIZE) {
+    while (pq->data->size() >= DEFAULT_MAX_PICT_QUEUE_SIZE) {
         pq->cond->wait(pq->mutex);
         if (ms->quit)
             return;
@@ -513,8 +549,12 @@ void DecodeThread::run()
             _mediaState->seek_req = 0;
         }
 
-        if (_mediaState->video_queue.data->size() > MAX_VIDEO_QUEUE_SIZE ||
-            _mediaState->audio_queue.data->size() > MAX_AUDIO_QUEUE_SIZE) {
+        if (total_frame_num > 0 && (total_frame_num % 100) == 0) {
+            adjust_queue_ratio(_mediaState);
+        }
+
+        if (_mediaState->video_queue.data->size() > _mediaState->max_video_queue_size ||
+            _mediaState->audio_queue.data->size() > _mediaState->max_audio_queue_size) {
             av_usleep(10000);
             ms_debug("queue is full, hold\n");
             QThread::yieldCurrentThread();
@@ -534,10 +574,12 @@ void DecodeThread::run()
 
         if (packet.stream_index == _mediaState->video_stream_id) {
             ms_debug("read_frame #%d, video frame\n", ++total_frame_num);
+            _mediaState->nb_video_frames++;
             packet_enqueue(&_mediaState->video_queue, &packet);
 
         } else if (packet.stream_index == _mediaState->audio_stream_id) {
             ms_debug("read_frame #%d, audio frame\n", ++total_frame_num);
+            _mediaState->nb_audio_frames++;
             packet_enqueue(&_mediaState->audio_queue, &packet);
 
         } else {
@@ -757,9 +799,9 @@ static int decode_audio_frame(MediaState *ms)
 void ms_audio_callback(void* userdata, Uint8* stream, int len)
 {
     MediaState *ms = (MediaState *)userdata;
-
     AVCodecContext *audioCtx = ms->audio_context;
     AVStream *as = ms->format_context->streams[ms->audio_stream_id];
+    double consumed_accum = 0;
 
     while(len > 0) {
         ms_debug("sdl buf len: %d, audio_callback: buf_index: %d, buf_size: %d\n",
@@ -782,11 +824,16 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
             audioCtx->sample_rate, ms->audio_dst_fmt, 1);
         double consumed = (double)len1 / bytes_per_sec;
         ms->audio_clock += consumed;
+        consumed_accum += consumed;
         ms_debug("write %d bytes, bytes_per_sec: %d, consumed: %g, audio_clock: %g\n",
                  len1, bytes_per_sec, consumed, ms->audio_clock);
 
         ms->audio_buf_index += len1;
         stream += len1;
         len -= len1;
+
+        if (consumed_accum >= 0.04) {
+            QThread::yieldCurrentThread();
+        }
     }
 }

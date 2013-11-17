@@ -46,9 +46,9 @@ extern "C" {
  * TODO: maybe these constants needs to be calculated based on some
  * facts to keep us away from wait-forever.
  **/
-#define MAX_VIDEO_QUEUE_SIZE 10
-#define MAX_AUDIO_QUEUE_SIZE 20
-#define MAX_PICT_QUEUE_SIZE 2
+#define DEFAULT_MAX_VIDEO_QUEUE_SIZE 5
+#define DEFAULT_MAX_AUDIO_QUEUE_SIZE 15
+#define DEFAULT_MAX_PICT_QUEUE_SIZE 2
 
 static double ms_epic_time = 0;
 #define MS_DEBUG
@@ -157,6 +157,7 @@ struct MediaState
     int video_height;
 
     SDL_AudioDeviceID audio_dev_id;
+    SDL_AudioFormat audio_sdl_fmt;
     SwrContext *swrCtx;
     AVSampleFormat audio_dst_fmt;
     int audio_dst_chl; // layout
@@ -181,6 +182,15 @@ struct MediaState
     double picture_last_delay;
     double picture_last_pts;
     double picture_timer;
+
+    //accumulate frames decoded
+    int nb_audio_frames;
+    int nb_video_frames;
+
+    //dynamically adjust queue size
+    int max_video_queue_size;
+    int max_audio_queue_size;
+    int max_pict_queue_size;
 
     MediaPlayer *player;
 
