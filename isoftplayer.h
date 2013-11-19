@@ -46,9 +46,12 @@ extern "C" {
  * TODO: maybe these constants needs to be calculated based on some
  * facts to keep us away from wait-forever.
  **/
-#define DEFAULT_MAX_VIDEO_QUEUE_SIZE 5
-#define DEFAULT_MAX_AUDIO_QUEUE_SIZE 15
-#define DEFAULT_MAX_PICT_QUEUE_SIZE 2
+#define DEFAULT_MAX_VIDEO_QUEUE_SIZE 20
+#define DEFAULT_MAX_AUDIO_QUEUE_SIZE 40
+#define DEFAULT_MAX_PICT_QUEUE_SIZE 10
+
+#define MIN_VIDEO_QUEUE_SIZE 5
+#define MIN_AUDIO_QUEUE_SIZE 10
 
 static double ms_epic_time = 0;
 #define MS_DEBUG
@@ -173,6 +176,9 @@ struct MediaState
 
     QThread *decode_thread;
     VideoThread *video_thread;
+
+    QMutex *decode_mutex;
+    QWaitCondition *decode_continue_cond;
 
     PacketQueue video_queue;
     PacketQueue audio_queue;

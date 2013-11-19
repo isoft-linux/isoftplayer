@@ -184,6 +184,9 @@ MediaState *mediastate_init(const char *filename)
     // open_codec_for_type(ms, AVMEDIA_TYPE_SUBTITLE);
 
     ms->decode_thread = new DecodeThread(ms);
+    ms->decode_mutex = new QMutex;
+    ms->decode_continue_cond = new QWaitCondition;
+
     ms->player = new MediaPlayer(ms);
 
     if (ms->video_context) {
@@ -271,7 +274,8 @@ MediaState *mediastate_init(const char *filename)
 MediaPlayer::MediaPlayer(MediaState *ms)
     :QWidget(), _mediaState(ms)
 {
-    setAttribute(Qt::WA_TranslucentBackground);
+    setAttribute(Qt::WA_OpaquePaintEvent);
+    // setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_NoSystemBackground);
     setAutoFillBackground(false);
 
@@ -417,6 +421,7 @@ void MediaPlayer::keyPressEvent(QKeyEvent * kev)
         _mediaState->seek_req = 1;
         _mediaState->seek_flags = dir;
         _mediaState->seek_pos = get_master_clock(_mediaState) + dur;
+        _mediaState->decode_continue_cond->wakeAll();
         ms_debug("request seek_pos: %g\n", _mediaState->seek_pos);
 
 }
@@ -446,6 +451,7 @@ AVPacket packet_dequeue(PacketQueue *pq)
     MediaState *ms = (MediaState*)pq->opaque;
     QMutexLocker locker(pq->mutex);
     while (pq->data->size() == 0) {
+        ms_debug("queue is empty, wait\n");
         pq->cond->wait(pq->mutex);
         if (ms->quit) {
             return (AVPacket) { .data = NULL, .size = 0 };
@@ -485,6 +491,7 @@ void picture_enqueue(PictureQueue *pq, QImage frame, double pts)
     }
 
     VideoPicture pic = { .frame = frame, .pts = pts };
+    ms_debug("enque picture at %g\n", pts);
     pq->data->enqueue(pic);
     pq->cond->wakeAll();
 }
@@ -494,6 +501,7 @@ VideoPicture picture_dequeue(PictureQueue *pq)
     MediaState *ms = (MediaState*)pq->opaque;
     QMutexLocker locker(pq->mutex);
     while (pq->data->size() == 0) {
+        ms_debug("picture queue is empty, wait\n");
         pq->cond->wait(pq->mutex);
         if (ms->quit) {
             return (VideoPicture) {.pts = AV_NOPTS_VALUE };
@@ -501,6 +509,7 @@ VideoPicture picture_dequeue(PictureQueue *pq)
     }
 
     VideoPicture vp = pq->data->dequeue();
+    ms_debug("deque picture at %g\n", vp.pts);
     pq->cond->wakeAll();
     return vp;
 }
@@ -553,18 +562,23 @@ void DecodeThread::run()
             adjust_queue_ratio(_mediaState);
         }
 
-        if (_mediaState->video_queue.data->size() > _mediaState->max_video_queue_size ||
-            _mediaState->audio_queue.data->size() > _mediaState->max_audio_queue_size) {
-            av_usleep(10000);
+        int aqs = _mediaState->audio_queue.data->size(),
+            vqs = _mediaState->video_queue.data->size();
+
+        if (vqs > _mediaState->max_video_queue_size || aqs > _mediaState->max_audio_queue_size) {
+            _mediaState->decode_mutex->lock();
+            // QThread::usleep(10000);
             ms_debug("queue is full, hold\n");
-            QThread::yieldCurrentThread();
+            _mediaState->decode_continue_cond->wait(_mediaState->decode_mutex, 100);
+            _mediaState->decode_mutex->unlock();
             continue;
         }
+
 
         ret = av_read_frame(_mediaState->format_context, &packet);
         if (ret < 0) {
             if (_mediaState->format_context->pb->error == 0) {
-                av_usleep(100); /* no error; wait for user input */
+                QThread::usleep(1000); /* no error; wait for user input */
                 continue;
             } else {
                 ms_debug("read frame failed\n");
@@ -645,8 +659,6 @@ QImage VideoThread::scaleFrame(AVFrame *frame)
     uchar *buf = img.bits();
     int linesizes[4];
     av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
-    sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
-              videoCtx->height, (uint8_t *const *)&buf, linesizes);
     ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / 1000000.0);
     return img;
 }
@@ -750,7 +762,6 @@ static int decode_audio_frame(MediaState *ms)
                     ms->audio_buf_size = 0;
                 }
 
-
                 int out_nb_samples = av_rescale_rnd(
                     swr_get_delay(ms->swrCtx, audioCtx->sample_rate) + ms->audio_frame->nb_samples,
                     ms->audio_dst_rate, audioCtx->sample_rate, AV_ROUND_UP) + 256;
@@ -775,6 +786,10 @@ static int decode_audio_frame(MediaState *ms)
 
         if (ms->quit) {
             return -1;
+        }
+
+        if (ms->audio_queue.data->size() == 0) {
+            ms->decode_continue_cond->wakeAll();
         }
 
         ms->audio_pkt = packet_dequeue(&ms->audio_queue);
