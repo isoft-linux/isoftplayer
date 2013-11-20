@@ -659,6 +659,8 @@ QImage VideoThread::scaleFrame(AVFrame *frame)
     uchar *buf = img.bits();
     int linesizes[4];
     av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
+    sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
+              videoCtx->height, (uint8_t *const *)&buf, linesizes);
     ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / 1000000.0);
     return img;
 }
