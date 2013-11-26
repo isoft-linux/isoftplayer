@@ -8,3 +8,4 @@ moc_*.cpp
 Makefile
 *.app
 log[0-9]
+isoftplayer

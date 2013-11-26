@@ -1,15 +1,23 @@
 #ifndef _isoftplayer_h
 #define _isoftplayer_h
 
-#if !defined USING_PCH
+#include <QtCore/QtCore>
+#include <QtOpenGL/QtOpenGL>
+#include <QtWidgets/QtWidgets>
+#include <QtGui/QtGui>
 
 #ifdef __linux__
 #include <inttypes.h>
 #include <stdint.h>
+
+#  ifdef HAS_LIBVA
+#  include "vaapi.h"
+#  endif
 #endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/vaapi.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -21,16 +29,6 @@ extern "C" {
 }
 
 #include <SDL2/SDL.h>
-
-#include <QtCore/QtCore>
-#include <QtOpenGL/QtOpenGL>
-#include <QtWidgets/QtWidgets>
-#include <QtGui/QtGui>
-
-#else
-#warning "using precompiled pch"
-#include "precompiled.pch"
-#endif
 
 #define MS_SYNC_THRESHOLD 0.01    // in seconds
 #define MS_NOSYNC_THRESHOLD 10.0  // in seconds
@@ -48,23 +46,47 @@ extern "C" {
  **/
 #define DEFAULT_MAX_VIDEO_QUEUE_SIZE 20
 #define DEFAULT_MAX_AUDIO_QUEUE_SIZE 40
-#define DEFAULT_MAX_PICT_QUEUE_SIZE 10
+#define DEFAULT_MAX_PICT_QUEUE_SIZE 1
 
 #define MIN_VIDEO_QUEUE_SIZE 5
 #define MIN_AUDIO_QUEUE_SIZE 10
 
-static double ms_epic_time = 0;
-#define MS_DEBUG
-#ifdef MS_DEBUG
-#define ms_debug(fmt, ...)  do {                                        \
-        av_log(NULL, AV_LOG_DEBUG, "[%lx][%F]", (long)QThread::currentThread(), (double)(av_gettime() / 1000000.0 - ms_epic_time)); \
-        av_log(NULL, AV_LOG_DEBUG, fmt, ##__VA_ARGS__);                  \
-    } while(0)
-#else
-#define ms_debug(fmt, ...)  do {} while(0)
-#endif
 
 typedef struct MediaState MediaState;
+
+typedef struct PacketQueue_
+{
+    QMutex *mutex;
+    QWaitCondition *cond;
+    QQueue<AVPacket> *data;
+    void *opaque;
+} PacketQueue;
+
+PacketQueue packet_queue_init(void *opaque);
+void packet_enqueue(PacketQueue *pq, AVPacket *pkt);
+AVPacket packet_dequeue(PacketQueue *pq);
+void packet_queue_flush(PacketQueue *pq);
+
+typedef struct VideoPicture_
+{
+   /* QImage frame; */
+    double pts; // pts in seconds
+    uint8_t *data[4];
+    int linesize[4];
+    AVPixelFormat format;
+} VideoPicture;
+
+typedef struct PictureQueue_
+{
+    QMutex *mutex;
+    QWaitCondition *cond;
+    QQueue<VideoPicture> *data;
+    void *opaque;
+} PictureQueue;
+
+PictureQueue picture_queue_init(void *opaque);
+void picture_enqueue(PictureQueue *pq, VideoPicture vp, double pts);
+VideoPicture picture_dequeue(PictureQueue *pq);
 
 class DecodeThread: public QThread
 {
@@ -86,7 +108,7 @@ public:
 
 protected:
     void run();
-    QImage scaleFrame(AVFrame *frame);
+    VideoPicture scaleFrame(AVFrame *frame);
     void createScaleContext();
 
     MediaState *_mediaState;
@@ -97,36 +119,6 @@ protected:
     enum AVPixelFormat _last_pix_fmt;
 };
 
-typedef struct PacketQueue_
-{
-    QMutex *mutex;
-    QWaitCondition *cond;
-    QQueue<AVPacket> *data;
-    void *opaque;
-} PacketQueue;
-
-PacketQueue packet_queue_init(void *opaque);
-void packet_enqueue(PacketQueue *pq, AVPacket *pkt);
-AVPacket packet_dequeue(PacketQueue *pq);
-void packet_queue_flush(PacketQueue *pq);
-
-typedef struct VideoPicture_
-{
-    QImage frame;
-    double pts; // pts in seconds
-} VideoPicture;
-
-typedef struct PictureQueue_
-{
-    QMutex *mutex;
-    QWaitCondition *cond;
-    QQueue<VideoPicture> *data;
-    void *opaque;
-} PictureQueue;
-
-PictureQueue picture_queue_init(void *opaque);
-void picture_enqueue(PictureQueue *pq, QImage frame, double pts);
-VideoPicture picture_dequeue(PictureQueue *pq);
 
 enum MediaStateFlags
 {
@@ -199,6 +191,11 @@ struct MediaState
     int max_pict_queue_size;
 
     MediaPlayer *player;
+
+    int hwaccel_enabled; // enabled and started correctly
+#ifdef HAS_LIBVA
+    struct ms_va_sys_t *p_va;
+#endif
 
     double seek_pos; // in seconds
     int seek_flags;

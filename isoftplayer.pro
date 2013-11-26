@@ -10,25 +10,27 @@ system(which clang++ 1>/dev/null 2>&1) {
 TEMPLATE = app
 TARGET = isoftplayer
 QT_CONFIG -= no-pkg-config
-CONFIG += qt debug link_pkgconfig 
+CONFIG += qt debug link_pkgconfig
 QT += gui core widgets opengl
 INCLUDEPATH += .
 
 QMAKE_CXXFLAGS += -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS
 
 unix|macx {
-	CONFIG += link_pkgconfig
-	PKGCONFIG += libavcodec libavutil libswresample libavformat libswscale sdl2
-	packagesExist(libavcodec) {
-		DEFINES += HAS_AVCODEC
-	}
+    CONFIG += link_pkgconfig
+    PKGCONFIG += libavcodec libavutil libswresample libavformat libswscale sdl2
 }
 
-PRECOMPILED_HEADER = precompiled.pch
-precompile_header:!isEmpty(PRECOMPILED_HEADER) {
-    DEFINES += USING_PCH
+linux:packagesExist(libva) {
+    DEFINES += HAS_LIBVA
+    PKGCONFIG += libva x11 libva-x11
 }
 
 # Input
-SOURCES += isoftplayer.cpp main.cpp
-HEADERS += isoftplayer.h
+SOURCES += isoftplayer.cpp main.cpp utils.cpp
+HEADERS += isoftplayer.h utils.h
+
+packagesExist(libva) {
+    SOURCES += vaapi.cpp
+    HEADERS += vaapi.h
+}

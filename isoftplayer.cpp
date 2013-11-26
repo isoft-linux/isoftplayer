@@ -5,21 +5,31 @@
 #include <assert.h>
 
 #include "isoftplayer.h"
+#include "utils.h"
 
 static void ms_audio_callback(void* userdata, Uint8* stream, int len);
 
 #define FLUSH_PKT_DATA "flush"
-static AVPacket flush_pkt = {.data = (unsigned char*)FLUSH_PKT_DATA, .size = sizeof(FLUSH_PKT_DATA) };
+static AVPacket flush_pkt = {
+    .data = (unsigned char*)FLUSH_PKT_DATA,
+    .size = sizeof(FLUSH_PKT_DATA)
+};
 
-static void err_quit(const char *fmt, ...)
+#ifdef HAS_LIBVA
+static enum AVPixelFormat get_va_format(struct AVCodecContext *avctx, const enum AVPixelFormat *fmt)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-
-    exit(-1);
+  return PIX_FMT_VAAPI_VLD;
 }
+
+static int get_va_buffer(struct AVCodecContext *avctx, AVFrame *frame)
+{
+  ms_va_sys_t *p_va = (ms_va_sys_t*)avctx->opaque;
+  ms_va_get(p_va, frame);
+  frame->type = FF_BUFFER_TYPE_USER;
+  return 0;
+}
+#endif
+
 
 static double get_audio_clock(MediaState *ms)
 {
@@ -76,6 +86,8 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 	AVCodecContext *avctx = ms->format_context->streams[stream_id]->codec;
     AVCodec *avcodec = NULL;
 
+
+
     if (ms->flags & MS_HW_DECODER_PREFERRED) {
         //TODO: more elegant way to detect codec type and platform to choose best codec
         if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
@@ -87,16 +99,39 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 #       endif
         }
     }
+
     if (!avcodec) {
         avcodec = avcodec_find_decoder(avctx->codec_id);
     }
+
 	if (avcodec == NULL) {
 		err_quit("avcodec_find_decoder failed");
 	}
 
+    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
+#ifdef HAS_LIBVA
+        if (ms_open_va(avcodec->id, &ms->p_va) < 0) {
+            err_quit("ms_open_va failed\n");
+        }
+        avctx->opaque = ms->p_va;
+
+        if (ms_va_setup(ms->p_va, &avctx->hwaccel_context, avctx->width, avctx->height) < 0) {
+            err_quit("ms_va_setup failed\n");
+        }
+
+        ms->hwaccel_enabled = 1;
+        avctx->get_format = get_va_format;
+        avctx->get_buffer = get_va_buffer;
+        ms_debug("avctx->hw_ctx: %p, p_va->hw_ctx: %p\n", avctx->hwaccel_context,
+                 ms->p_va->hw_ctx);
+        assert(avctx->hwaccel_context == &ms->p_va->hw_ctx);
+#endif
+    }
+
 	if (avcodec_open2(avctx, avcodec, NULL) < 0) {
 		err_quit("avcodec_open failed");
 	}
+
 
     ms_debug( "open_codec %s for_type %d at %d\n", avcodec->long_name, codec_type, stream_id);
     switch(codec_type) {
@@ -274,10 +309,15 @@ MediaState *mediastate_init(const char *filename)
 MediaPlayer::MediaPlayer(MediaState *ms)
     :QWidget(), _mediaState(ms)
 {
-    setAttribute(Qt::WA_OpaquePaintEvent);
-    // setAttribute(Qt::WA_TranslucentBackground);
-    setAttribute(Qt::WA_NoSystemBackground);
-    setAutoFillBackground(false);
+    if (_mediaState->hwaccel_enabled) {
+        // this is for direct rendering (vaapi)
+        setAttribute(Qt::WA_PaintOnScreen);
+    } else {
+        // this is for indirect performance boost
+        setAttribute(Qt::WA_OpaquePaintEvent);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAutoFillBackground(false);
+    }
 
     ms->player = this;
     QSize dsize = qApp->desktop()->geometry().size();
@@ -318,8 +358,6 @@ MediaPlayer::~MediaPlayer()
 
 void MediaPlayer::run()
 {
-    ms_epic_time = (double)av_gettime() / 1000000.0;
-
     _mediaState->decode_thread->start();
     if (_mediaState->video_context) {
         _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
@@ -338,7 +376,17 @@ void MediaPlayer::run()
 void MediaPlayer::updateDisplay()
 {
     VideoPicture vp = picture_dequeue(&_mediaState->picture_queue);
-    QImage frame = vp.frame;
+    // directly fill qimage data use ARGB32_Premultiplied is way much
+    // faster than ARGB32, which save a conversion see code here
+    // http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
+    // convertARGB32FromARGB32PM is used if not premultiplied.  qt doc
+    // (QPainter doc) also recommends this format.
+    if (!_mediaState->hwaccel_enabled) {
+        QImage frame(vp.data[0], _mediaState->video_width, _mediaState->video_height,
+                     QImage::Format_ARGB32_Premultiplied);
+        _surface = frame;
+        // free(vp.data[0]); // should not freed here, but where
+    }
 
     double delay = vp.pts - _mediaState->picture_last_pts;
     if (delay > 1.0 || delay < 0.0) {
@@ -371,8 +419,24 @@ void MediaPlayer::updateDisplay()
              vp.pts, sync_threshold, delay, actual_delay, ref_clock, actual_delay);
     scheduleUpdate(actual_delay * 1000);
 
-    _surface = frame;
-    update();
+    if (_mediaState->hwaccel_enabled) {
+#ifdef HAS_LIBVA
+        VASurfaceID surfaceId = (VASurfaceID)(uintptr_t)vp.data[3];
+        if (vaSyncSurface(_mediaState->p_va->p_display, surfaceId))  {
+            ms_debug("vaSyncSurface failed\n");
+        }
+
+        if (vaPutSurface(_mediaState->p_va->p_display, surfaceId,
+                         this->winId(), 0, 0, _mediaState->video_context->width,
+                         _mediaState->video_context->height,
+                         0, 0, _mediaState->video_width, _mediaState->video_height,
+                         NULL, 0, VA_FILTER_SCALING_DEFAULT)) {
+            ms_debug("vaPutSurface failed\n");
+        }
+#endif
+    } else {
+        update();
+    }
 }
 
 void MediaPlayer::scheduleUpdate(double delay)
@@ -480,9 +544,11 @@ PictureQueue picture_queue_init(void *opaque)
     return pq;
 }
 
-void picture_enqueue(PictureQueue *pq, QImage frame, double pts)
+void picture_enqueue(PictureQueue *pq, VideoPicture vp, double pts)
 {
     MediaState *ms = (MediaState*)pq->opaque;
+    AVCodecContext *videoCtx = ms->video_context;
+
     QMutexLocker locker(pq->mutex);
     while (pq->data->size() >= DEFAULT_MAX_PICT_QUEUE_SIZE) {
         pq->cond->wait(pq->mutex);
@@ -490,9 +556,10 @@ void picture_enqueue(PictureQueue *pq, QImage frame, double pts)
             return;
     }
 
-    VideoPicture pic = { .frame = frame, .pts = pts };
-    ms_debug("enque picture at %g\n", pts);
-    pq->data->enqueue(pic);
+    vp.pts = pts;
+    ms_debug("enque picture at pts %g\n", pts);
+
+    pq->data->enqueue(vp);
     pq->cond->wakeAll();
 }
 
@@ -616,7 +683,8 @@ void VideoThread::createScaleContext()
     AVCodecContext *videoCtx = _mediaState->video_context;
     const AVCodec *codec = videoCtx->codec;
     if (videoCtx->hwaccel) {
-        ms_debug("hwaccel enabled\n");
+        ms_debug("hwaccel enabled, do not scale now\n");
+        return;
     }
 
     if (_swsCtx) {
@@ -625,6 +693,8 @@ void VideoThread::createScaleContext()
     }
 
     _last_pix_fmt = videoCtx->pix_fmt;
+    // _last_pix_fmt = AV_PIX_FMT_NV12;
+    // _last_pix_fmt = AV_PIX_FMT_YUV420P;
     ms_debug("scaling video context %s fmt %s\n",
              videoCtx->codec->long_name, av_get_pix_fmt_name(_last_pix_fmt));
 
@@ -635,7 +705,7 @@ void VideoThread::createScaleContext()
     //used to Convert origin frame into ARGB
     //TODO: user opt to choose quality
     _swsCtx = sws_getContext(videoCtx->width, videoCtx->height, _last_pix_fmt, vw,
-                             vh, dst_fmt, SWS_BILINEAR, NULL, NULL, NULL);
+                             vh, dst_fmt, SWS_BILINEAR|SWS_CPU_CAPS_MMX2, NULL, NULL, NULL);
 
     if (!_swsCtx) {
         ms_debug("scale context failed from %s to %s\n",
@@ -645,24 +715,40 @@ void VideoThread::createScaleContext()
 
 }
 
-QImage VideoThread::scaleFrame(AVFrame *frame)
+VideoPicture VideoThread::scaleFrame(AVFrame *frame)
 {
     AVCodecContext *videoCtx = _mediaState->video_context;
+    VideoPicture pic;
+    pic.format = videoCtx->pix_fmt;
+
+    if (_mediaState->hwaccel_enabled) {
+#ifdef HAS_LIBVA
+        memcpy(pic.data, frame->data, sizeof(pic.data));
+        memcpy(pic.linesize, frame->linesize, sizeof(pic.linesize));
+        ms_debug("copy only pointer values in hwaccel mode. sizeof: %d\n",
+                 sizeof(pic.data));
+#endif
+        return pic;
+    }
 
     int64_t start = av_gettime();
-    //directly fill qimage data
-    //use ARGB32_Premultiplied is way much faster than ARGB32, which save a conversion
-    //see code here http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
-    //convertARGB32FromARGB32PM is used if not premultiplied.
-    //qt doc (QPainter doc) also recommends this format.
-    QImage img(_mediaState->video_width, _mediaState->video_height, QImage::Format_ARGB32_Premultiplied);
-    uchar *buf = img.bits();
-    int linesizes[4];
-    av_image_fill_linesizes(linesizes, AV_PIX_FMT_BGRA, _mediaState->video_width);
+
+    // int linesizes[4];
+    av_image_fill_linesizes(pic.linesize, AV_PIX_FMT_BGRA, _mediaState->video_width);
+    pic.data[0] = (uint8_t *)malloc(pic.linesize[0] * _mediaState->video_height);
+//     if (_mediaState->hwaccel_enabled) {
+// #ifdef HAS_LIBVA
+//         if (ms_va_extract(_mediaState->p_va, _swsCtx, videoCtx, (uint8_t**)&buf,
+//                           &linesizes, frame) < 0) {
+//             ms_debug("extract failed\n");
+//         }
+// #endif
+//     }
+
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
-              videoCtx->height, (uint8_t *const *)&buf, linesizes);
+              videoCtx->height, (uint8_t *const *)pic.data, pic.linesize);
     ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / 1000000.0);
-    return img;
+    return pic;
 }
 
 void VideoThread::run()
