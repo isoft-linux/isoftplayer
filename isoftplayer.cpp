@@ -86,8 +86,6 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 	AVCodecContext *avctx = ms->format_context->streams[stream_id]->codec;
     AVCodec *avcodec = NULL;
 
-
-
     if (ms->flags & MS_HW_DECODER_PREFERRED) {
         //TODO: more elegant way to detect codec type and platform to choose best codec
         if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && avctx->codec_id == AV_CODEC_ID_H264) {
@@ -133,7 +131,8 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 	}
 
 
-    ms_debug( "open_codec %s for_type %d at %d\n", avcodec->long_name, codec_type, stream_id);
+    ms_debug( "open_codec %s for_type %d at %d\n", avcodec->long_name,
+              codec_type, stream_id);
     switch(codec_type) {
     case AVMEDIA_TYPE_VIDEO:
         ms->video_context = avctx;
@@ -171,6 +170,19 @@ void mediastate_close(MediaState *ms)
         delete ms->video_queue.mutex;
         delete ms->video_queue.cond;
         delete ms->video_queue.data;
+    }
+
+    if (ms->subtitle_context) {
+        ms->subtitle_queue.cond->wakeAll();
+        ms->subtitle_thread->wait();
+        ms_debug("delete subtitle_thread\n");
+
+        ms_ass_free(ms->assCtx);
+
+        avcodec_close(ms->subtitle_context);
+        delete ms->subtitle_queue.mutex;
+        delete ms->subtitle_queue.cond;
+        delete ms->subtitle_queue.data;
     }
 
     if (ms->audio_context) {
@@ -216,13 +228,11 @@ MediaState *mediastate_init(const char *filename)
 
     open_codec_for_type(ms, AVMEDIA_TYPE_VIDEO);
     open_codec_for_type(ms, AVMEDIA_TYPE_AUDIO);
-    // open_codec_for_type(ms, AVMEDIA_TYPE_SUBTITLE);
+    open_codec_for_type(ms, AVMEDIA_TYPE_SUBTITLE);
 
     ms->decode_thread = new DecodeThread(ms);
     ms->decode_mutex = new QMutex;
     ms->decode_continue_cond = new QWaitCondition;
-
-    ms->player = new MediaPlayer(ms);
 
     if (ms->video_context) {
         ms->video_thread = new VideoThread(ms);
@@ -233,7 +243,8 @@ MediaState *mediastate_init(const char *filename)
         ms->picture_last_delay = 40e-3; // 40 ms
         ms->picture_last_pts = 0;
 
-        ms->picture_queue = picture_queue_init((void*)ms);
+        ms->picture_queue = guarded_queue_init<VideoPicture>((void*)ms);
+        ms->picture_queue.expected_capacity = DEFAULT_MAX_PICT_QUEUE_SIZE;
     }
 
     if (ms->audio_context) {
@@ -299,9 +310,22 @@ MediaState *mediastate_init(const char *filename)
         }
     }
 
+    if (ms->subtitle_context) {
+        ms->subtitle_thread = new SubtitleThread(ms);
+        ms->subtitle_queue = packet_queue_init((void*)ms);
+
+        ms->subpicture_queue = guarded_queue_init<SubPicture>((void*)ms);
+        ms->subpicture_queue.expected_capacity = 2;
+
+        ms->assCtx = ms_ass_init(ms);
+        ms->last_subp.pts = AV_NOPTS_VALUE;
+    }
+
     ms->max_pict_queue_size = DEFAULT_MAX_PICT_QUEUE_SIZE;
     ms->max_video_queue_size = DEFAULT_MAX_VIDEO_QUEUE_SIZE;
     ms->max_audio_queue_size = DEFAULT_MAX_AUDIO_QUEUE_SIZE;
+
+    ms->player = new MediaPlayer(ms);
 
     return ms;
 }
@@ -346,6 +370,11 @@ MediaPlayer::MediaPlayer(MediaState *ms)
     ms->video_width = vsize.width();
     ms->video_height = vsize.height();
 
+    AssInfo ai = {
+        .fields = AIF_SIZE, .width = vsize.width(), .height = vsize.height()
+    };
+    ms_ass_update_info(ms->assCtx, ai);
+
     move((dsize.width()-width())/2, (dsize.height()-height())/2);
 
     QTimer::singleShot(0, this, SLOT(run()));
@@ -363,6 +392,9 @@ void MediaPlayer::run()
         _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
         _mediaState->video_thread->start();
 
+        if (_mediaState->subtitle_context) {
+            _mediaState->subtitle_thread->start();
+        }
     }
 
     if (_mediaState->audio_context) {
@@ -375,13 +407,54 @@ void MediaPlayer::run()
 
 void MediaPlayer::updateDisplay()
 {
-    VideoPicture vp = picture_dequeue(&_mediaState->picture_queue);
-    // directly fill qimage data use ARGB32_Premultiplied is way much
-    // faster than ARGB32, which save a conversion see code here
-    // http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
-    // convertARGB32FromARGB32PM is used if not premultiplied.  qt doc
-    // (QPainter doc) also recommends this format.
+    VideoPicture vp = guarded_dequeue(&_mediaState->picture_queue);
     if (!_mediaState->hwaccel_enabled) {
+        //peek
+        //TODO: take subtitle and blend it
+        bool render_subtitle = false;
+        if (_mediaState->last_subp.pts == AV_NOPTS_VALUE) {
+            SubPicture next = guarded_dequeue(&_mediaState->subpicture_queue, false);
+            if (next.pts != AV_NOPTS_VALUE) {
+                ms_debug("get first ass subpicture\n");
+                _mediaState->last_subp = next;
+                ms_ass_process_packet(_mediaState->assCtx, next.sub);
+            }
+        }
+
+        if (_mediaState->last_subp.pts != AV_NOPTS_VALUE) {
+            const SubPicture &subp = _mediaState->last_subp;
+            ms_debug("subp pts: %g, vp.pts: %g\n", subp.pts, vp.pts);
+            if (ms_subp_contains_pts(subp, vp.pts*1000)) {
+                render_subtitle = true;
+                ms_debug("in range, blend ass\n");
+
+            } else if (ms_subp_ahead_of_pts(subp, vp.pts*1000)) {
+                render_subtitle = false;
+                ms_debug("ass is ahread of video\n");
+
+            } else { // ms_subp_behind_of_pts is true
+                SubPicture next = guarded_dequeue(&_mediaState->subpicture_queue, false);
+                ms_debug("ass is behind of video, get next\n");
+                if (next.pts != AV_NOPTS_VALUE) {
+
+                    _mediaState->last_subp = next;
+                    ms_ass_process_packet(_mediaState->assCtx, next.sub);
+                    //TODO: may need to check range again
+                }
+            }
+        }
+
+        if (render_subtitle) {
+            ms_ass_blend_rgba(_mediaState->assCtx, _mediaState->last_subp.pts,
+                              vp.data[0], vp.linesize[0], _mediaState->video_width,
+                              _mediaState->video_height);
+        }
+
+        // directly fill qimage data use ARGB32_Premultiplied is way much
+        // faster than ARGB32, which save a conversion see code here
+        // http://code.woboq.org/qt5/qtbase/src/gui/painting/qdrawhelper.cpp.html
+        // convertARGB32FromARGB32PM is used if not premultiplied.  qt doc
+        // (QPainter doc) also recommends this format.
         QImage frame(vp.data[0], _mediaState->video_width, _mediaState->video_height,
                      QImage::Format_ARGB32_Premultiplied);
         _surface = frame;
@@ -534,53 +607,6 @@ void packet_queue_flush(PacketQueue *pq)
     }
 }
 
-PictureQueue picture_queue_init(void *opaque)
-{
-    PictureQueue pq;
-    pq.cond = new QWaitCondition;
-    pq.data = new QQueue<VideoPicture>();
-    pq.mutex = new QMutex;
-    pq.opaque = opaque;
-    return pq;
-}
-
-void picture_enqueue(PictureQueue *pq, VideoPicture vp, double pts)
-{
-    MediaState *ms = (MediaState*)pq->opaque;
-    AVCodecContext *videoCtx = ms->video_context;
-
-    QMutexLocker locker(pq->mutex);
-    while (pq->data->size() >= DEFAULT_MAX_PICT_QUEUE_SIZE) {
-        pq->cond->wait(pq->mutex);
-        if (ms->quit)
-            return;
-    }
-
-    vp.pts = pts;
-    ms_debug("enque picture at pts %g\n", pts);
-
-    pq->data->enqueue(vp);
-    pq->cond->wakeAll();
-}
-
-VideoPicture picture_dequeue(PictureQueue *pq)
-{
-    MediaState *ms = (MediaState*)pq->opaque;
-    QMutexLocker locker(pq->mutex);
-    while (pq->data->size() == 0) {
-        ms_debug("picture queue is empty, wait\n");
-        pq->cond->wait(pq->mutex);
-        if (ms->quit) {
-            return (VideoPicture) {.pts = AV_NOPTS_VALUE };
-        }
-    }
-
-    VideoPicture vp = pq->data->dequeue();
-    ms_debug("deque picture at %g\n", vp.pts);
-    pq->cond->wakeAll();
-    return vp;
-}
-
 void DecodeThread::run()
 {
     AVPacket packet;
@@ -601,11 +627,14 @@ void DecodeThread::run()
             }
 
             if (stream) {
-                int64_t seek_target = av_rescale_q((int64_t)(_mediaState->seek_pos*AV_TIME_BASE),
-                                                   AV_TIME_BASE_Q, stream->time_base);
-                ms_debug("seek to target: %lld(%g)\n", seek_target, (double)seek_target*av_q2d(stream->time_base));
-                int ret = av_seek_frame(_mediaState->format_context, stream->index, seek_target,
-                                        _mediaState->seek_flags);
+                int64_t seek_target = av_rescale_q(
+                    (int64_t)(_mediaState->seek_pos*AV_TIME_BASE),
+                    AV_TIME_BASE_Q, stream->time_base);
+                ms_debug("seek to target: %lld(%g)\n", seek_target,
+                         (double)seek_target*av_q2d(stream->time_base));
+                int ret = av_seek_frame(
+                    _mediaState->format_context, stream->index, seek_target,
+                    _mediaState->seek_flags);
                 if (ret < 0) {
                     ms_debug("seek failed\n");
                 } else {
@@ -632,10 +661,11 @@ void DecodeThread::run()
         int aqs = _mediaState->audio_queue.data->size(),
             vqs = _mediaState->video_queue.data->size();
 
-        if (vqs > _mediaState->max_video_queue_size || aqs > _mediaState->max_audio_queue_size) {
+        if (vqs > _mediaState->max_video_queue_size ||
+            aqs > _mediaState->max_audio_queue_size) {
             _mediaState->decode_mutex->lock();
-            // QThread::usleep(10000);
-            ms_debug("queue is full, hold\n");
+            ms_debug("%s queue is full, hold\n",
+                     (vqs > _mediaState->max_video_queue_size ? "video": "audio"));
             _mediaState->decode_continue_cond->wait(_mediaState->decode_mutex, 100);
             _mediaState->decode_mutex->unlock();
             continue;
@@ -662,6 +692,10 @@ void DecodeThread::run()
             ms_debug("read_frame #%d, audio frame\n", ++total_frame_num);
             _mediaState->nb_audio_frames++;
             packet_enqueue(&_mediaState->audio_queue, &packet);
+
+        } else if (packet.stream_index == _mediaState->subtitle_stream_id) {
+            ms_debug("read_frame #%d, subtitle frame\n", ++total_frame_num);
+            packet_enqueue(&_mediaState->subtitle_queue, &packet);
 
         } else {
             av_free_packet(&packet);
@@ -793,7 +827,9 @@ void VideoThread::run()
                      av_get_picture_type_char(frame->pict_type), _mediaState->video_width,
                      _mediaState->video_height, av_frame_get_best_effort_timestamp(frame),
                      frame->key_frame, frame->repeat_pict);
-            picture_enqueue(&_mediaState->picture_queue, scaleFrame(frame), pts);
+            VideoPicture vp = scaleFrame(frame);
+            vp.pts = pts;
+            guarded_enqueue(&_mediaState->picture_queue, vp);
             av_free_packet(&pkt);
 
         } else {
@@ -803,6 +839,51 @@ void VideoThread::run()
 
     avcodec_free_frame(&frame);
     sws_freeContext(_swsCtx);
+}
+
+
+void SubtitleThread::run()
+{
+    int gotSubtitle = 0;
+    AVCodecContext *subCtx = _mediaState->subtitle_context;
+    AVStream *ss = _mediaState->format_context->streams[_mediaState->subtitle_stream_id];
+    for (;;) {
+        if (_mediaState->quit) {
+            break;
+        }
+
+        AVPacket pkt = packet_dequeue(&_mediaState->subtitle_queue);
+        if (!pkt.data)
+            continue;
+
+        if (pkt.data == flush_pkt.data) {
+            avcodec_flush_buffers(subCtx);
+            continue;
+        }
+
+        SubPicture subp;
+        avcodec_decode_subtitle2(subCtx, &subp.sub, &gotSubtitle, &pkt);
+        if (gotSubtitle) {
+            if (subp.sub.pts != AV_NOPTS_VALUE)
+                subp.pts = subp.sub.pts / (double)AV_TIME_BASE;
+            else if (pkt.pts != AV_NOPTS_VALUE)
+                subp.pts = pkt.pts * av_q2d(ss->time_base);
+            else
+                subp.pts = pkt.dts;
+
+            ms_debug("subtitle pts %g, S: %d, E: %d, fmt: %d, #%d rects type: %d, clrs: %d\n",
+                     subp.pts, subp.sub.start_display_time, subp.sub.end_display_time,
+                     subp.sub.format, subp.sub.num_rects, subp.sub.rects[0]->type,
+                     subp.sub.rects[0]->nb_colors);
+            ms_debug("ass: [%s]\n", subp.sub.rects[0]->ass);
+            ms_debug("text: [%s]\n", subp.sub.rects[0]->text);
+            guarded_enqueue(&_mediaState->subpicture_queue, subp);
+            av_free_packet(&pkt);
+
+        } else {
+            ms_debug("subtitle not finished\n");
+        }
+    }
 }
 
 static int decode_audio_frame(MediaState *ms)
@@ -903,7 +984,6 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
 {
     MediaState *ms = (MediaState *)userdata;
     AVCodecContext *audioCtx = ms->audio_context;
-    AVStream *as = ms->format_context->streams[ms->audio_stream_id];
     double consumed_accum = 0;
 
     while(len > 0) {
@@ -939,4 +1019,27 @@ void ms_audio_callback(void* userdata, Uint8* stream, int len)
             QThread::yieldCurrentThread();
         }
     }
+}
+
+int ms_subp_contains_pts(const SubPicture& subp, double pts_in_ms)
+{
+    assert (subp.pts != AV_NOPTS_VALUE);
+    ms_debug("ms_subp_contains_pts: sub.pts: %lld, S: %lld, E: %lld, pts: %g\n",
+             subp.sub.pts / 1000,
+             subp.sub.start_display_time, subp.sub.end_display_time, pts_in_ms);
+
+    return (subp.sub.pts / 1000 + subp.sub.start_display_time <= pts_in_ms) &&
+        (subp.sub.pts / 1000 + subp.sub.end_display_time >= pts_in_ms);
+}
+
+int ms_subp_behind_of_pts(const SubPicture& subp, double pts_in_ms)
+{
+    assert (subp.pts != AV_NOPTS_VALUE);
+    return subp.sub.pts / 1000 + subp.sub.end_display_time < pts_in_ms;
+}
+
+int ms_subp_ahead_of_pts(const SubPicture& subp, double pts_in_ms)
+{
+    assert (subp.pts != AV_NOPTS_VALUE);
+    return subp.sub.pts / 1000 + subp.sub.start_display_time > pts_in_ms;
 }

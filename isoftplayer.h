@@ -15,6 +15,9 @@
 #  endif
 #endif
 
+#include "subtitle.h"
+#include "utils.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/vaapi.h>
@@ -69,25 +72,36 @@ void packet_queue_flush(PacketQueue *pq);
 
 typedef struct VideoPicture_
 {
-   /* QImage frame; */
     double pts; // pts in seconds
     uint8_t *data[4];
     int linesize[4];
     AVPixelFormat format;
 } VideoPicture;
 
-typedef struct PictureQueue_
+typedef struct SubPicture_
+{
+    AVSubtitle sub;
+    double pts; // pts in seconds
+} SubPicture;
+
+/* check if pts_in_ms is in the range of Subtitle Event */
+int ms_subp_contains_pts(const SubPicture& subp, double pts_in_ms);
+/* check if pts_in_ms is left behind by Subtitle Event */
+int ms_subp_ahead_of_pts(const SubPicture& subp, double pts_in_ms);
+/* check if pts_in_ms is ahead of Subtitle Event */
+int ms_subp_behind_of_pts(const SubPicture& subp, double pts_in_ms);
+
+template <typename T>
+struct GuardedQueue
 {
     QMutex *mutex;
     QWaitCondition *cond;
-    QQueue<VideoPicture> *data;
+    QQueue<T> *data;
     void *opaque;
-} PictureQueue;
-
-PictureQueue picture_queue_init(void *opaque);
-void picture_enqueue(PictureQueue *pq, VideoPicture vp, double pts);
-VideoPicture picture_dequeue(PictureQueue *pq);
-
+    int expected_capacity;
+};
+typedef GuardedQueue<SubPicture> SubPictureQueue;
+typedef GuardedQueue<VideoPicture> PictureQueue;
 class DecodeThread: public QThread
 {
 public:
@@ -119,6 +133,18 @@ protected:
     enum AVPixelFormat _last_pix_fmt;
 };
 
+class SubtitleThread: public QThread
+{
+    Q_OBJECT
+public:
+    SubtitleThread(MediaState *ms)
+        :_mediaState(ms) {}
+
+protected:
+    void run();
+
+    MediaState *_mediaState;
+};
 
 enum MediaStateFlags
 {
@@ -166,15 +192,21 @@ struct MediaState
     AVPacket audio_pkt;
     AVPacket audio_pkt_temp; // who's data field may be alerted due to flush
 
+    SubPicture last_subp;
+
     QThread *decode_thread;
     VideoThread *video_thread;
+    QThread *subtitle_thread;
 
     QMutex *decode_mutex;
     QWaitCondition *decode_continue_cond;
 
     PacketQueue video_queue;
     PacketQueue audio_queue;
+    PacketQueue subtitle_queue;
+
     PictureQueue picture_queue;
+    SubPictureQueue subpicture_queue;
 
     double audio_clock; // in seconds
     double picture_last_delay;
@@ -196,6 +228,8 @@ struct MediaState
 #ifdef HAS_LIBVA
     struct ms_va_sys_t *p_va;
 #endif
+
+    AssContext *assCtx;
 
     double seek_pos; // in seconds
     int seek_flags;
@@ -228,5 +262,54 @@ private:
     MediaState *_mediaState;
     QImage _surface;
 };
+
+
+template <typename T>
+GuardedQueue<T> guarded_queue_init(void *opaque)
+{
+    GuardedQueue<T> q;
+    q.cond = new QWaitCondition;
+    q.data = new QQueue<T>();
+    q.mutex = new QMutex;
+    q.opaque = opaque;
+    q.expected_capacity = 1;
+    return q;
+}
+
+template <typename T>
+void guarded_enqueue(GuardedQueue<T> *q, T t)
+{
+    MediaState *ms = (MediaState*)q->opaque;
+
+    QMutexLocker locker(q->mutex);
+    while (q->data->size() >= q->expected_capacity) {
+        q->cond->wait(q->mutex);
+        if (ms->quit)
+            return;
+    }
+
+    ms_debug("enque guarded at pts %g\n", t.pts);
+
+    q->data->enqueue(t);
+    q->cond->wakeAll();
+}
+
+template <typename T>
+T guarded_dequeue(GuardedQueue<T> *q, bool block = true)
+{
+    MediaState *ms = (MediaState*)q->opaque;
+    QMutexLocker locker(q->mutex);
+    while (q->data->size() == 0) {
+        if (ms->quit || !block) {
+            return (T) {.pts = AV_NOPTS_VALUE };
+        }
+        q->cond->wait(q->mutex);
+    }
+
+    T t = q->data->dequeue();
+    ms_debug("deque guarded at %g\n", t.pts);
+    q->cond->wakeAll();
+    return t;
+}
 
 #endif

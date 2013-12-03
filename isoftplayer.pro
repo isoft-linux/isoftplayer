@@ -22,6 +22,9 @@ unix|macx {
 }
 
 linux:packagesExist(libva) {
+    SOURCES += vaapi.cpp
+    HEADERS += vaapi.h
+
     DEFINES += HAS_LIBVA
     PKGCONFIG += libva x11 libva-x11
 }
@@ -30,7 +33,9 @@ linux:packagesExist(libva) {
 SOURCES += isoftplayer.cpp main.cpp utils.cpp
 HEADERS += isoftplayer.h utils.h
 
-packagesExist(libva) {
-    SOURCES += vaapi.cpp
-    HEADERS += vaapi.h
+SOURCES += subtitle.cpp
+HEADERS += subtitle.h
+packagesExist(libass) {
+    DEFINES += HAS_LIBASS
+    PKGCONFIG += libass freetype2
 }
