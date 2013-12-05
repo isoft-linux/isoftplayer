@@ -18,11 +18,9 @@ extern "C" {
 struct MediaState;
 
 struct AssContext {
-#ifdef HAS_LIBASS
     ASS_Library *ass_lib;
     ASS_Renderer *ass_render;
     ASS_Track *ass_track;
-#endif
 
     MediaState *media_state;
 };
@@ -44,6 +42,7 @@ void ms_ass_free(AssContext *ctx);
 void ms_ass_process_packet(AssContext *, AVSubtitle sub);
 /* blend subtitle into image data */
 void ms_ass_blend_rgba(AssContext *ctx, double pts, uint8_t *data, int linesize, int width, int height);
+
 /* changes like frame size needs to be informed */
 void ms_ass_update_info(AssContext *ctx, AssInfo info);
 #endif

@@ -156,23 +156,28 @@ void mediastate_close(MediaState *ms)
 {
     ms_debug("clean up\n");
     ms->quit = 1;
-    ms->picture_queue.cond->wakeAll();
 
-    delete ms->player;
+    ms->decode_thread->wait();
+    ms_debug("delete decode_thread\n");
+    delete ms->decode_thread;
 
     free((void*)ms->media_name);
     if (ms->video_context) {
+        guarded_queue_flush(&ms->picture_queue);
+        packet_queue_flush(&ms->video_queue);
         ms->video_queue.cond->wakeAll();
         ms->video_thread->wait();
         ms_debug("delete video_thread\n");
 
-        avcodec_close(ms->video_context);
         delete ms->video_queue.mutex;
         delete ms->video_queue.cond;
         delete ms->video_queue.data;
+
+        avcodec_close(ms->video_context);
     }
 
     if (ms->subtitle_context) {
+        packet_queue_flush(&ms->subtitle_queue);
         ms->subtitle_queue.cond->wakeAll();
         ms->subtitle_thread->wait();
         ms_debug("delete subtitle_thread\n");
@@ -183,27 +188,28 @@ void mediastate_close(MediaState *ms)
         delete ms->subtitle_queue.mutex;
         delete ms->subtitle_queue.cond;
         delete ms->subtitle_queue.data;
+
+        guarded_queue_delete(&ms->subpicture_queue);
     }
 
     if (ms->audio_context) {
+        packet_queue_flush(&ms->audio_queue);
         ms->audio_queue.cond->wakeAll();
 
-        avcodec_close(ms->audio_context);
+        SDL_CloseAudioDevice(ms->audio_dev_id);
+        SDL_Quit();
         delete ms->audio_queue.mutex;
         delete ms->audio_queue.cond;
         delete ms->audio_queue.data;
 
+        avcodec_close(ms->audio_context);
+
         av_frame_free(&ms->audio_frame);
 
         swr_free(&ms->swrCtx);
-
-        SDL_CloseAudioDevice(ms->audio_dev_id);
-        SDL_Quit();
     }
 
-    ms->decode_thread->wait();
-    ms_debug("delete decode_thread\n");
-    delete ms->decode_thread;
+    delete ms->player;
 
     avformat_close_input(&ms->format_context);
     av_free(ms);
@@ -236,19 +242,19 @@ MediaState *mediastate_init(const char *filename)
 
     if (ms->video_context) {
         ms->video_thread = new VideoThread(ms);
-        ms->video_queue = packet_queue_init((void*)ms);
+        ms->video_queue = packet_queue_init((void*)ms, "videoq");
 
         // nearly the time video codec opened
         ms->picture_timer = (double)av_gettime() / 1000000.0;
         ms->picture_last_delay = 40e-3; // 40 ms
         ms->picture_last_pts = 0;
 
-        ms->picture_queue = guarded_queue_init<VideoPicture>((void*)ms);
+        ms->picture_queue = guarded_queue_init<VideoPicture>((void*)ms, "pictq");
         ms->picture_queue.expected_capacity = DEFAULT_MAX_PICT_QUEUE_SIZE;
     }
 
     if (ms->audio_context) {
-        ms->audio_queue = packet_queue_init((void*)ms);
+        ms->audio_queue = packet_queue_init((void*)ms, "audioq");
 
         AVCodecContext *audioCtx = ms->audio_context;
         if (SDL_Init(SDL_INIT_AUDIO) < 0) {
@@ -312,10 +318,10 @@ MediaState *mediastate_init(const char *filename)
 
     if (ms->subtitle_context) {
         ms->subtitle_thread = new SubtitleThread(ms);
-        ms->subtitle_queue = packet_queue_init((void*)ms);
+        ms->subtitle_queue = packet_queue_init((void*)ms, "subq");
 
-        ms->subpicture_queue = guarded_queue_init<SubPicture>((void*)ms);
-        ms->subpicture_queue.expected_capacity = 2;
+        ms->subpicture_queue = guarded_queue_init<SubPicture>((void*)ms, "subpictq");
+        ms->subpicture_queue.expected_capacity = 100;
 
         ms->assCtx = ms_ass_init(ms);
         ms->last_subp.pts = AV_NOPTS_VALUE;
@@ -522,17 +528,6 @@ void MediaPlayer::paintEvent(QPaintEvent *pe)
     Q_UNUSED(pe);
     QPainter p(this);
     p.drawImage(0, 0, _surface);
-
-    // QPen pen(Qt::green);
-    // pen.setBrush(QColor(0, 255, 0, 80));
-    // p.setPen(pen);
-
-    // QFont f = p.font();
-    // f.setPointSize(20);
-    // p.setFont(f);
-
-    // QString osd = QString("elapsed: %1").arg(get_master_clock(_mediaState));
-    // p.drawText(20, 20, osd);
 }
 
 void MediaPlayer::keyPressEvent(QKeyEvent * kev)
@@ -563,9 +558,10 @@ void MediaPlayer::keyPressEvent(QKeyEvent * kev)
 
 }
 
-PacketQueue packet_queue_init(void *opaque)
+PacketQueue packet_queue_init(void *opaque, const char *name)
 {
     PacketQueue pq;
+    pq.name = strdup(name);
     pq.mutex = new QMutex;
     pq.cond = new QWaitCondition;
     pq.data = new QQueue<AVPacket>();
@@ -588,8 +584,9 @@ AVPacket packet_dequeue(PacketQueue *pq)
     MediaState *ms = (MediaState*)pq->opaque;
     QMutexLocker locker(pq->mutex);
     while (pq->data->size() == 0) {
-        ms_debug("queue is empty, wait\n");
+        ms_debug("queue %s is empty, wait\n", pq->name);
         pq->cond->wait(pq->mutex);
+        ms_debug("queue %s released from wait\n", pq->name);
         if (ms->quit) {
             return (AVPacket) { .data = NULL, .size = 0 };
         }
@@ -637,9 +634,11 @@ void DecodeThread::run()
                     _mediaState->seek_flags);
                 if (ret < 0) {
                     ms_debug("seek failed\n");
+
                 } else {
                     //flush and notify
                     if (_mediaState->video_context) {
+                        guarded_queue_flush(&_mediaState->picture_queue);
                         packet_queue_flush(&_mediaState->video_queue);
                         packet_enqueue(&_mediaState->video_queue, &flush_pkt);
                     }
@@ -647,6 +646,13 @@ void DecodeThread::run()
                     if (_mediaState->audio_context) {
                         packet_queue_flush(&_mediaState->audio_queue);
                         packet_enqueue(&_mediaState->audio_queue, &flush_pkt);
+                    }
+
+                    if (_mediaState->subtitle_context) {
+                        _mediaState->last_subp.pts = AV_NOPTS_VALUE;
+                        guarded_queue_flush(&_mediaState->subpicture_queue);
+                        packet_queue_flush(&_mediaState->subtitle_queue);
+                        packet_enqueue(&_mediaState->subtitle_queue, &flush_pkt);
                     }
                 }
             }
@@ -666,7 +672,7 @@ void DecodeThread::run()
             _mediaState->decode_mutex->lock();
             ms_debug("%s queue is full, hold\n",
                      (vqs > _mediaState->max_video_queue_size ? "video": "audio"));
-            _mediaState->decode_continue_cond->wait(_mediaState->decode_mutex, 100);
+            _mediaState->decode_continue_cond->wait(_mediaState->decode_mutex, 10);
             _mediaState->decode_mutex->unlock();
             continue;
         }
@@ -674,9 +680,12 @@ void DecodeThread::run()
 
         ret = av_read_frame(_mediaState->format_context, &packet);
         if (ret < 0) {
-            if (_mediaState->format_context->pb->error == 0) {
-                QThread::usleep(1000); /* no error; wait for user input */
+            if (ret == AVERROR_EOF || url_feof(_mediaState->format_context->pb)) {
+                ms_debug("eof reached\n");
+                QThread::usleep(1000);
+                _mediaState->quit = 1;
                 continue;
+
             } else {
                 ms_debug("read frame failed\n");
                 break;
@@ -767,7 +776,6 @@ VideoPicture VideoThread::scaleFrame(AVFrame *frame)
 
     int64_t start = av_gettime();
 
-    // int linesizes[4];
     av_image_fill_linesizes(pic.linesize, AV_PIX_FMT_BGRA, _mediaState->video_width);
     pic.data[0] = (uint8_t *)malloc(pic.linesize[0] * _mediaState->video_height);
 //     if (_mediaState->hwaccel_enabled) {

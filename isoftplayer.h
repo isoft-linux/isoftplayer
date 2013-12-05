@@ -59,13 +59,14 @@ typedef struct MediaState MediaState;
 
 typedef struct PacketQueue_
 {
+    char *name;
     QMutex *mutex;
     QWaitCondition *cond;
     QQueue<AVPacket> *data;
     void *opaque;
 } PacketQueue;
 
-PacketQueue packet_queue_init(void *opaque);
+PacketQueue packet_queue_init(void *opaque, const char *name);
 void packet_enqueue(PacketQueue *pq, AVPacket *pkt);
 AVPacket packet_dequeue(PacketQueue *pq);
 void packet_queue_flush(PacketQueue *pq);
@@ -94,6 +95,7 @@ int ms_subp_behind_of_pts(const SubPicture& subp, double pts_in_ms);
 template <typename T>
 struct GuardedQueue
 {
+    char *name; // name of queue, used for debug
     QMutex *mutex;
     QWaitCondition *cond;
     QQueue<T> *data;
@@ -102,6 +104,8 @@ struct GuardedQueue
 };
 typedef GuardedQueue<SubPicture> SubPictureQueue;
 typedef GuardedQueue<VideoPicture> PictureQueue;
+
+
 class DecodeThread: public QThread
 {
 public:
@@ -265,9 +269,10 @@ private:
 
 
 template <typename T>
-GuardedQueue<T> guarded_queue_init(void *opaque)
+GuardedQueue<T> guarded_queue_init(void *opaque, const char *name)
 {
     GuardedQueue<T> q;
+    q.name = strdup(name);
     q.cond = new QWaitCondition;
     q.data = new QQueue<T>();
     q.mutex = new QMutex;
@@ -283,12 +288,14 @@ void guarded_enqueue(GuardedQueue<T> *q, T t)
 
     QMutexLocker locker(q->mutex);
     while (q->data->size() >= q->expected_capacity) {
-        q->cond->wait(q->mutex);
         if (ms->quit)
             return;
+
+        ms_debug("guarded %s is full, block wait\n", q->name);
+        q->cond->wait(q->mutex);
     }
 
-    ms_debug("enque guarded at pts %g\n", t.pts);
+    ms_debug("enque guarded %s at pts %g\n", q->name, t.pts);
 
     q->data->enqueue(t);
     q->cond->wakeAll();
@@ -303,13 +310,33 @@ T guarded_dequeue(GuardedQueue<T> *q, bool block = true)
         if (ms->quit || !block) {
             return (T) {.pts = AV_NOPTS_VALUE };
         }
+        ms_debug("guarded %s is empty, block wait\n", q->name);
         q->cond->wait(q->mutex);
     }
 
     T t = q->data->dequeue();
-    ms_debug("deque guarded at %g\n", t.pts);
+    ms_debug("deque guarded %s at %g\n", q->name, t.pts);
     q->cond->wakeAll();
     return t;
+}
+
+template <typename T>
+T guarded_queue_flush(GuardedQueue<T> *q)
+{
+    //TODO: need to free T anyway
+    QMutexLocker locker(q->mutex);
+    while (q->data->size()) {
+        q->data->dequeue();
+    }
+    q->cond->wakeAll();
+}
+
+template <typename T>
+void guarded_queue_delete(GuardedQueue<T> *q)
+{
+    delete q->cond;
+    delete q->mutex;
+    delete q->data; // need to release
 }
 
 #endif
