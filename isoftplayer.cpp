@@ -245,7 +245,7 @@ MediaState *mediastate_init(const char *filename)
         ms->video_queue = packet_queue_init((void*)ms, "videoq");
 
         // nearly the time video codec opened
-        ms->picture_timer = (double)av_gettime() / 1000000.0;
+        ms->picture_timer = (double)av_gettime() / (double)AV_TIME_BASE;
         ms->picture_last_delay = 40e-3; // 40 ms
         ms->picture_last_pts = 0;
 
@@ -395,7 +395,7 @@ void MediaPlayer::run()
 {
     _mediaState->decode_thread->start();
     if (_mediaState->video_context) {
-        _mediaState->picture_timer = (double)av_gettime() / 1000000.0;
+        _mediaState->picture_timer = (double)av_gettime() / (double)AV_TIME_BASE;
         _mediaState->video_thread->start();
 
         if (_mediaState->subtitle_context) {
@@ -413,6 +413,11 @@ void MediaPlayer::run()
 
 void MediaPlayer::updateDisplay()
 {
+    if (_mediaState->paused) {
+        QTimer::singleShot(20, this, SLOT(updateDisplay()));
+        return;
+    }
+
     VideoPicture vp = guarded_dequeue(&_mediaState->picture_queue);
     if (!_mediaState->hwaccel_enabled) {
         //peek
@@ -489,7 +494,7 @@ void MediaPlayer::updateDisplay()
 
     _mediaState->picture_timer += delay;
     // acutal delay considers time elapsed for preparing frame to display
-    double actual_delay = _mediaState->picture_timer - ((double)av_gettime() / 1000000.0);
+    double actual_delay = _mediaState->picture_timer - ((double)av_gettime() / (double)AV_TIME_BASE);
     ms_debug("actual_delay before: %g\n", actual_delay);
     if (actual_delay < 0.01) {
         actual_delay = 0.01;
@@ -520,6 +525,10 @@ void MediaPlayer::updateDisplay()
 
 void MediaPlayer::scheduleUpdate(double delay)
 {
+    if (_mediaState->quit) {
+        qApp->quit();
+        return;
+    }
     QTimer::singleShot(delay, this, SLOT(updateDisplay()));
 }
 
@@ -535,26 +544,51 @@ void MediaPlayer::keyPressEvent(QKeyEvent * kev)
     ms_debug("key pressed, modifiers: %d\n", (int)kev->modifiers());
     int dir = 0;
     double dur = 0;
-
-        switch(kev->key()) {
-        case Qt::Key_Left: dir = AVSEEK_FLAG_BACKWARD; dur = -10; break;
-        case Qt::Key_Right: dir = 0; dur = 10; break;
-        case Qt::Key_Up: dir = 0; dur = 60; break;
-        case Qt::Key_Down: dir = AVSEEK_FLAG_BACKWARD; dur = -60; break;
-        default:
-            return;
-        }
-
+    if (kev->key() == Qt::Key_Space) {
         if (_mediaState->seek_req) {
-            ms_debug("seeking is occurring\n");
+            ms_debug("a seek is going on, cancel pause req\n");
             return;
         }
 
-        _mediaState->seek_req = 1;
-        _mediaState->seek_flags = dir;
-        _mediaState->seek_pos = get_master_clock(_mediaState) + dur;
-        _mediaState->decode_continue_cond->wakeAll();
-        ms_debug("request seek_pos: %g\n", _mediaState->seek_pos);
+        // I need to change pause state before wake steams, this does
+        // not cause dead lock problem
+        int old_val = _mediaState->paused;
+        _mediaState->paused = !_mediaState->paused;
+        if (old_val) {
+            if (_mediaState->video_context)
+                _mediaState->video_queue.cond->wakeAll();
+
+            if (_mediaState->audio_context)
+                _mediaState->audio_queue.cond->wakeAll();
+
+            _mediaState->picture_timer += av_gettime() / (double)AV_TIME_BASE - _mediaState->time_to_pause;
+        } else {
+            _mediaState->time_to_pause = av_gettime() / (double)AV_TIME_BASE;
+        }
+
+        ms_debug("request to %spause stream\n", (old_val?"un":""));
+        return;
+    }
+
+    switch(kev->key()) {
+    case Qt::Key_Left: dir = AVSEEK_FLAG_BACKWARD; dur = -10; break;
+    case Qt::Key_Right: dir = 0; dur = 10; break;
+    case Qt::Key_Up: dir = 0; dur = 60; break;
+    case Qt::Key_Down: dir = AVSEEK_FLAG_BACKWARD; dur = -60; break;
+    default:
+        return;
+    }
+
+    if (_mediaState->seek_req) {
+        ms_debug("seeking is occurring\n");
+        return;
+    }
+
+    _mediaState->seek_req = 1;
+    _mediaState->seek_flags = dir;
+    _mediaState->seek_pos = get_master_clock(_mediaState) + dur;
+    _mediaState->decode_continue_cond->wakeAll();
+    ms_debug("request seek_pos: %g\n", _mediaState->seek_pos);
 
 }
 
@@ -583,10 +617,9 @@ AVPacket packet_dequeue(PacketQueue *pq)
 {
     MediaState *ms = (MediaState*)pq->opaque;
     QMutexLocker locker(pq->mutex);
-    while (pq->data->size() == 0) {
-        ms_debug("queue %s is empty, wait\n", pq->name);
+    while (pq->data->size() == 0 || ms->paused) {
+        ms_debug("queue %s is empty or stream paused, wait\n", pq->name);
         pq->cond->wait(pq->mutex);
-        ms_debug("queue %s released from wait\n", pq->name);
         if (ms->quit) {
             return (AVPacket) { .data = NULL, .size = 0 };
         }
@@ -682,7 +715,6 @@ void DecodeThread::run()
         if (ret < 0) {
             if (ret == AVERROR_EOF || url_feof(_mediaState->format_context->pb)) {
                 ms_debug("eof reached\n");
-                QThread::usleep(1000);
                 _mediaState->quit = 1;
                 continue;
 
@@ -789,7 +821,7 @@ VideoPicture VideoThread::scaleFrame(AVFrame *frame)
 
     sws_scale(_swsCtx, (const uint8_t *const *)frame->data, frame->linesize, 0,
               videoCtx->height, (uint8_t *const *)pic.data, pic.linesize);
-    ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / 1000000.0);
+    ms_debug("sws_scaling time: %g\n", (av_gettime() - start) / (double)AV_TIME_BASE);
     return pic;
 }
 

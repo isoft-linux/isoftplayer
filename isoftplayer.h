@@ -238,6 +238,9 @@ struct MediaState
     double seek_pos; // in seconds
     int seek_flags;
     int seek_req;
+
+    int paused;
+    double time_to_pause; // timestamp in seconds when last pause happens
 };
 
 void mediastate_close(MediaState *ms);
