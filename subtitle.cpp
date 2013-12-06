@@ -55,8 +55,12 @@ AssContext *ms_ass_init(MediaState *ms)
         goto ctx_error;
     }
 
+#if LIBASS_VERSION >= 0x01020000
     ass_set_storage_size(ctx->ass_render, ms->video_context->width,
                        ms->video_context->height);
+#else
+    ass_set_aspect_ratio(ctx->ass_render, 1.0, 1.0);
+#endif
     // by default, set par = 1.0
     ass_set_frame_size(ctx->ass_render, ms->video_context->width,
                        ms->video_context->height);

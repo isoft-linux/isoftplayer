@@ -26,7 +26,7 @@ linux:packagesExist(libva) {
     HEADERS += vaapi.h
 
     DEFINES += HAS_LIBVA
-    PKGCONFIG += libva x11 libva-x11
+    PKGCONFIG += libva x11 libva-x11 gl
 }
 
 # Input
