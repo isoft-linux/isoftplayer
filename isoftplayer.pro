@@ -15,6 +15,7 @@ QT += gui core widgets opengl
 INCLUDEPATH += .
 
 QMAKE_CXXFLAGS += -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS
+QMAKE_CXXFLAGS += -std=c++14 -Wno-narrowing
 
 unix|macx {
     CONFIG += link_pkgconfig

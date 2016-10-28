@@ -1,4 +1,5 @@
 .qmake.cache
+.qmake.stash
 *.swp
 *~
 .*~

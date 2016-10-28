@@ -7,6 +7,10 @@
 #include "isoftplayer.h"
 #include "utils.h"
 
+#if LIBAVUTIL_BUILD >= AV_VERSION_INT(54, 31, 100)
+#define SWS_CPU_CAPS_MMX2     0x20000000
+#endif
+
 static void ms_audio_callback(void* userdata, Uint8* stream, int len);
 
 #define FLUSH_PKT_DATA "flush"
@@ -18,14 +22,21 @@ static AVPacket flush_pkt = {
 #ifdef HAS_LIBVA
 static enum AVPixelFormat get_va_format(struct AVCodecContext *avctx, const enum AVPixelFormat *fmt)
 {
-  return PIX_FMT_VAAPI_VLD;
+#if LIBAVUTIL_BUILD >= AV_VERSION_INT(54, 31, 100)
+    return AV_PIX_FMT_VAAPI_VLD;
+#else
+    return PIX_FMT_VAAPI_VLD;
+#endif
 }
 
 static int get_va_buffer(struct AVCodecContext *avctx, AVFrame *frame)
 {
   ms_va_sys_t *p_va = (ms_va_sys_t*)avctx->opaque;
   ms_va_get(p_va, frame);
+  // FIXME: how to migrate to newer ffmpeg2.x/3.x
+#if LIBAVUTIL_BUILD < AV_VERSION_INT(54, 31, 100)
   frame->type = FF_BUFFER_TYPE_USER;
+#endif
   return 0;
 }
 #endif
@@ -119,7 +130,10 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 
         ms->hwaccel_enabled = 1;
         avctx->get_format = get_va_format;
+        // FIXME: how to migrate to newer ffmpeg2.x/3.x
+#if LIBAVUTIL_BUILD < AV_VERSION_INT(54, 31, 100)
         avctx->get_buffer = get_va_buffer;
+#endif
         ms_debug("avctx->hw_ctx: %p, p_va->hw_ctx: %p\n", avctx->hwaccel_context,
                  ms->p_va->hw_ctx);
         assert(avctx->hwaccel_context == &ms->p_va->hw_ctx);
@@ -296,9 +310,11 @@ MediaState *mediastate_init(const char *filename)
             if (real_spec.freq != audioCtx->sample_rate) {
                 ms_debug("sdl sample_rate does not agree with ours\n");
             }
-
+#if LIBAVUTIL_BUILD >= AV_VERSION_INT(54, 31, 100)
+            ms->audio_frame = av_frame_alloc();
+#else
             ms->audio_frame = avcodec_alloc_frame();
-
+#endif
             char buf[1024];
             av_get_channel_layout_string(buf, sizeof(buf)-1, -1,
                                          audioCtx->channel_layout);
@@ -830,7 +846,11 @@ void VideoThread::run()
     int frameFinished = 0;
     AVCodecContext *videoCtx = _mediaState->video_context;
     AVStream *vs = _mediaState->format_context->streams[_mediaState->video_stream_id];
+#if LIBAVUTIL_BUILD >= AV_VERSION_INT(54, 31, 100)
+    AVFrame *frame = av_frame_alloc();
+#else
     AVFrame *frame = avcodec_alloc_frame();
+#endif
     createScaleContext();
 
     for (;;) {
@@ -876,8 +896,11 @@ void VideoThread::run()
             ms_debug("frame not finished\n");
         }
     }
-
+#if LIBAVUTIL_BUILD >= AV_VERSION_INT(54, 31, 100)
+    av_frame_free(&frame);
+#else
     avcodec_free_frame(&frame);
+#endif
     sws_freeContext(_swsCtx);
 }
 
