@@ -91,7 +91,8 @@ static int open_codec_for_type(MediaState *ms, AVMediaType codec_type)
 
     int stream_id = av_find_best_stream(ms->format_context, codec_type, -1, -1, NULL, 0);
     if (stream_id < 0) {
-        err_quit("can not found stream\n");
+        ms_debug("can not found stream\n");
+        return stream_id;
     }
 
 	AVCodecContext *avctx = ms->format_context->streams[stream_id]->codec;
@@ -395,7 +396,8 @@ MediaPlayer::MediaPlayer(MediaState *ms)
     AssInfo ai = {
         .fields = AIF_SIZE, .width = vsize.width(), .height = vsize.height()
     };
-    ms_ass_update_info(ms->assCtx, ai);
+    if (ms->subtitle_context)
+        ms_ass_update_info(ms->assCtx, ai);
 
     move((dsize.width()-width())/2, (dsize.height()-height())/2);
 
@@ -436,45 +438,47 @@ void MediaPlayer::updateDisplay()
 
     VideoPicture vp = guarded_dequeue(&_mediaState->picture_queue);
     if (!_mediaState->hwaccel_enabled) {
-        //peek
-        //TODO: take subtitle and blend it
-        bool render_subtitle = false;
-        if (_mediaState->last_subp.pts == AV_NOPTS_VALUE) {
-            SubPicture next = guarded_dequeue(&_mediaState->subpicture_queue, false);
-            if (next.pts != AV_NOPTS_VALUE) {
-                ms_debug("get first ass subpicture\n");
-                _mediaState->last_subp = next;
-                ms_ass_process_packet(_mediaState->assCtx, next.sub);
-            }
-        }
-
-        if (_mediaState->last_subp.pts != AV_NOPTS_VALUE) {
-            const SubPicture &subp = _mediaState->last_subp;
-            ms_debug("subp pts: %g, vp.pts: %g\n", subp.pts, vp.pts);
-            if (ms_subp_contains_pts(subp, vp.pts*1000)) {
-                render_subtitle = true;
-                ms_debug("in range, blend ass\n");
-
-            } else if (ms_subp_ahead_of_pts(subp, vp.pts*1000)) {
-                render_subtitle = false;
-                ms_debug("ass is ahread of video\n");
-
-            } else { // ms_subp_behind_of_pts is true
+        if (_mediaState->subtitle_context) {
+            //peek
+            //TODO: take subtitle and blend it
+            bool render_subtitle = false;
+            if (_mediaState->last_subp.pts == AV_NOPTS_VALUE) {
                 SubPicture next = guarded_dequeue(&_mediaState->subpicture_queue, false);
-                ms_debug("ass is behind of video, get next\n");
                 if (next.pts != AV_NOPTS_VALUE) {
-
+                    ms_debug("get first ass subpicture\n");
                     _mediaState->last_subp = next;
                     ms_ass_process_packet(_mediaState->assCtx, next.sub);
-                    //TODO: may need to check range again
                 }
             }
-        }
 
-        if (render_subtitle) {
-            ms_ass_blend_rgba(_mediaState->assCtx, _mediaState->last_subp.pts,
-                              vp.data[0], vp.linesize[0], _mediaState->video_width,
-                              _mediaState->video_height);
+            if (_mediaState->last_subp.pts != AV_NOPTS_VALUE) {
+                const SubPicture &subp = _mediaState->last_subp;
+                ms_debug("subp pts: %g, vp.pts: %g\n", subp.pts, vp.pts);
+                if (ms_subp_contains_pts(subp, vp.pts*1000)) {
+                    render_subtitle = true;
+                    ms_debug("in range, blend ass\n");
+
+                } else if (ms_subp_ahead_of_pts(subp, vp.pts*1000)) {
+                    render_subtitle = false;
+                    ms_debug("ass is ahread of video\n");
+
+                } else { // ms_subp_behind_of_pts is true
+                    SubPicture next = guarded_dequeue(&_mediaState->subpicture_queue, false);
+                    ms_debug("ass is behind of video, get next\n");
+                    if (next.pts != AV_NOPTS_VALUE) {
+
+                        _mediaState->last_subp = next;
+                        ms_ass_process_packet(_mediaState->assCtx, next.sub);
+                        //TODO: may need to check range again
+                    }
+                }
+            }
+
+            if (render_subtitle) {
+                ms_ass_blend_rgba(_mediaState->assCtx, _mediaState->last_subp.pts,
+                        vp.data[0], vp.linesize[0], _mediaState->video_width,
+                        _mediaState->video_height);
+            }
         }
 
         // directly fill qimage data use ARGB32_Premultiplied is way much
